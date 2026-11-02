@@ -1,0 +1,726 @@
+{% extends "base.html" %}
+{% block title %}Repricing · Hotel Price Monitor{% endblock %}
+
+{#
+  FROM "WHERE DO WE SIT" TO "WHAT SHOULD IT BE"
+  =============================================
+  The comparison page says where the owner's rate sits against everyone
+  else's. This page takes the next step: for every room of the owner's
+  property it shows the market figure the rule computed, the price the rule
+  wants, and why it will or will not be written -- and the two buttons that
+  write it, one that only looks and one that does.
+
+  Nothing on this page moves a rate by itself unless the automatic switch
+  in the rule section is on. It ships off.
+#}
+
+{% block content %}
+<div class="page-head">
+  <div>
+    <h1>Repricing</h1>
+    <p class="muted">
+      Tonight ({{ check_in.strftime('%a %d %b %Y') }}): every room of yours against the
+      market, and the rate the rule proposes. <strong>Nothing is written unless you
+      press Apply or switch the automatic mode on.</strong>
+    </p>
+    {# Is the automatic mode doing anything? Answered here, in one line,
+       rather than by reading the whole log. #}
+    {% if last_auto_change is defined %}
+    <p class="last-auto-change">
+      {% if last_auto_change %}
+        {% set c = last_auto_change %}
+        Last automatic change:
+        <strong>{{ c.created_at | localtime('%d %b %H:%M') }}</strong> —
+        {{ c.room_name or c.rms_room or 'a room' }}{% if c.plan %} {{ c.plan }}{% endif %}
+        {% if c.current_rms is not none %}{{ money(c.current_rms) }} → {% endif %}{{ money(c.applied_rms) if c.applied_rms is not none else '—' }}
+      {% else %}
+        No automatic change yet.
+      {% endif %}
+      <span class="muted">· Today: {{ auto_changes_today }} rate{{ '' if auto_changes_today == 1 else 's' }} changed</span>
+      · <a href="/notifications?log=changes&day={{ today.isoformat() }}#repricer-log">see the changes</a>
+    </p>
+    {% endif %}
+  </div>
+</div>
+
+{#
+  THE PLAN A PRICE IS ON, printed under it. OUR RESORT's Standard Double is sold
+  room only while Competitor A's room is read on breakfast, and without the
+  label the two figures look like-for-like when they are not. ``other`` is
+  the plan on the far side of the comparison: a label that differs from it
+  is marked, so a mismatch is seen rather than worked out.
+#}
+{% macro board_note(plan, other=none) %}
+  {%- if plan %}<br><span class="board{% if other and other != plan %} board-differs{% endif %}">{{ plan|lower }}</span>{% endif -%}
+{% endmacro %}
+
+{#
+  A ROW WITH NOTHING TO WRITE, said as such. The rule still disagrees with
+  the prices, but the rate it lands on is already in the cell, so every run
+  -- automatic or pressed -- finds it there and writes nothing. A green
+  "will apply" here read as though the automatic switch were not working.
+  See rule.nothing_to_write for the two ways a row gets here.
+#}
+{% macro idle_status(idle, cur, p, channel) %}
+  <span class="tag settled">no change needed</span>
+  {% if idle == "written" %}
+    <span class="muted">already applied: RMS holds {{ money(cur) }}; waiting for {{ channel }} to show the new price</span>
+  {% else %}
+    {% if p.with_tax and rule.in_gst_gap(p.target) %}<span class="muted">no price with tax exists between ₹7,875 and ₹8,851 (the GST slab), so {{ money(p.target) }} cannot be shown; {{ money(p.our_price) }} is the closest under it</span>
+    {% else %}<span class="muted">RMS already holds {{ money(cur) }}, the rate this proposal comes to</span>{% endif %}
+  {% endif %}
+{% endmacro %}
+
+{#
+  ONE ROOM ON ANOTHER WEBSITE'S RULE (Agoda, Goibibo), in that website's
+  own section at the bottom of the page. The table at the top is Booking.com
+  and nothing else: a website with a rule of its own is shown and applied
+  here, never there.
+#}
+{% macro lane_cells(L, p) %}
+  {% set r = L.rule %}
+  {% set m = mappings.get(p.room_type_id) %}
+  {#- The sum is the route's (_lane_rms), so this row, the section's and the
+      box beside the website's tick cannot disagree. -#}
+  {% set ns = L.rms[p.room_type_id] %}
+  {% set anchor = ns.anchor %}
+  <td class="room"><strong>{{ p.room_name }}</strong>
+    {% if m %}<br><span class="muted">RMS: {{ m.rms_room }}{% if anchor %} › {{ m.rate_type_for(anchor) }}{% endif %}</span>{% else %}<br><span class="muted">not mapped</span>{% endif %}</td>
+  <td class="num">{% if p.our_price is not none %}{{ money(p.our_price) }}{% if p.our_note %} <em class="muted">{{ p.our_note }}</em>{% endif %}{{ board_note(p.board, r.benchmark_meal_plan if p.benchmark_entry else none) }}{% else %}—{% endif %}</td>
+  <td class="num market">
+    {% if p.market is not none %}{{ money(p.market) }}{% else %}—{% endif %}
+    {% if p.benchmark_entry %}
+      {{ board_note(r.benchmark_meal_plan) }}
+      <br><span class="muted">{{ p.benchmark_entry.room }}</span>
+      <br><span class="muted">− {{ money(r.benchmark_undercut) }} → {{ money(p.wanted) }}</span>
+    {% endif %}
+  </td>
+  <td class="num proposed">
+    {% if ns.settled %}<span class="muted">no change</span>
+    {% elif p.target is not none %}<strong>{{ money(p.target) }}</strong>
+      {% if p.change_pct is not none %}<br><span class="muted">{{ '%+.1f'|format(p.change_pct) }}%</span>{% endif %}
+      {% if p.wanted is not none and p.wanted != p.target %}<br><span class="muted">rule's own target {{ money(p.wanted) }}, limited by the {{ settings.max_step_pct|float|round|int }}% step</span>{% endif %}
+    {% else %}—{% endif %}
+    {#- This room on this website alone: the same job as the section's Apply,
+        narrowed to one room. Nothing typed or ticked for Booking.com rides
+        along -- the worker drops it for a channel run. -#}
+    {% if m and m.is_enabled and p.our_price and p.target is not none and not ns.settled and not ns.idle %}
+      <br><button type="button" class="apply-lane-room"
+              data-room-type-id="{{ p.room_type_id }}" data-room="{{ p.room_name }}"
+              data-channel="{{ r.channel }}" data-price="{{ p.target|int }}"
+              {% if not has_rate_app %}disabled data-locked-off="1"{% endif %}>Apply this room on {{ r.channel }}</button>
+    {% endif %}
+  </td>
+  <td class="num rms">
+    {% if ns.cur is not none %}
+      <span class="plan">{{ anchor }}</span>
+      {% if ns.settled or ns.idle %}{{ money(ns.cur) }} <span class="muted">{{ 'applied' if ns.idle == 'written' else 'stays' }}</span>
+      {% else %}{{ money(ns.cur) }} → <strong>{{ money(ns.rms_new) if ns.rms_new is not none else '—' }}</strong>{% endif %}
+      {% if ns.bounded and not ns.settled and not ns.idle %}<br><span class="muted">{{ ns.bounded }}</span>{% endif %}
+      <br><span class="muted">the other plans keep today's supplement</span>
+    {% elif m %}<span class="muted">read the grid first (Preview)</span>
+    {% else %}—{% endif %}
+  </td>
+  <td class="num site">
+    {% if ns.cur and ns.rms_new is not none and p.our_price %}
+      <strong>{{ money(rule.guest_sees(ns.rms_new, p.our_price, ns.base, with_tax=p.with_tax)|round|int) }}</strong>
+      <br><span class="muted">on {{ r.channel }}{% if r.benchmark_with_tax %}, tax in{% endif %}</span>
+    {% elif m %}<span class="muted">Preview to see</span>
+    {% else %}—{% endif %}
+  </td>
+  <td class="status">
+    {% if p.held %}<span class="tag held">held</span> <span class="muted">{{ p.held }}</span>
+    {% elif ns.settled %}<span class="tag settled">no change needed</span>
+      <span class="muted">already {{ money(r.benchmark_undercut) }} under {{ p.benchmark }}</span>
+    {% elif ns.idle %}{{ idle_status(ns.idle, ns.cur, p, r.channel) }}
+    {% elif p.target is not none %}{% if p.short_by %}<span class="tag short">applies, still over</span>
+      <span class="muted">{{ money(p.short_by) }} short; {{ p.capped }}</span>
+      {% else %}<span class="tag ok">will apply</span>{% if p.capped %} <span class="muted">{{ p.capped }}</span>{% endif %}{% endif %}
+    {% else %}—{% endif %}
+  </td>
+{% endmacro %}
+
+{% if not own %}
+<p class="panel">No hotel is marked as your own property yet. Mark one on its hotel page and come back.</p>
+{% else %}
+
+<section class="repricing-section">
+  <h2>Tonight's proposals — {{ own.name }}</h2>
+  {% if not proposals %}
+    <p class="muted">No prices for tonight yet, or no rooms are mapped below.</p>
+  {% else %}
+  <div class="grid-wrap">
+  <table class="grid">
+    <thead>
+      <tr>
+        <th>Room</th>
+        <th>Tier</th>
+        <th class="num">Our price{% if benchmark is defined and benchmark and settings.benchmark_with_tax %} <small class="muted">with tax</small>{% endif %}</th>
+        {# Not always a median any more: with a benchmark set it is that one
+           hotel's entry price, and a column still headed "(median)" would be
+           telling the owner the number came from ten hotels. #}
+        <th class="num">{% if benchmark is defined and benchmark %}{{ benchmark.name }}{% if settings.benchmark_with_tax %} <small class="muted">with tax</small>{% endif %}{% else %}Market (median){% endif %}</th>
+        <th>Competitors</th>
+        <th class="num">Proposed price</th>
+        {#
+          A SECOND OPINION IS NOISE BESIDE AN INSTRUCTION.
+          The model's number answers "where should this room sit", which is a
+          real question under the median rule and no question at all under
+          this one: the owner's rule is one subtraction from one hotel, and a
+          column offering 4,270 next to a rule that says 4,536 invites the
+          reader to wonder which is right when only one of them will ever be
+          written. So it is shown where it means something and left out where
+          it does not.
+        #}
+        {% if not (benchmark is defined and benchmark) %}
+        <th class="ai">AI suggests
+          <small class="muted">vs the market · (not applied)</small></th>
+        {% endif %}
+        <th class="num">In RMS</th>
+        {# THE ROUND TRIP, SHOWN. The proposed price is a guest price and the
+           RMS rate is derived from it, so the two are only equivalent while
+           the rounding is invisible. Printing what the written rate actually
+           comes back out as is the difference between trusting the sum and
+           checking it. #}
+        <th class="num">Guest will see</th>
+        <th>Status</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for p in proposals %}
+      {% set m = mappings.get(p.room_type_id) %}
+      <tr class="room-view {{ 'held' if p.held else ('ok' if p.target is not none else '') }}"
+          data-room-type-id="{{ p.room_type_id }}" data-view="{{ settings.channel }}">
+        <td class="room">
+          <strong>{{ p.room_name }}</strong>
+          {% if m %}<br><span class="muted">RMS: {{ m.rms_room }}</span>{% else %}<br><span class="muted">not mapped</span>{% endif %}
+        </td>
+        <td>{{ p.tier_label }}</td>
+        <td class="num">{% if p.our_price is not none %}{{ money(p.our_price) }}{% if p.our_note %} <em class="muted">{{ p.our_note }}</em>{% endif %}{{ board_note(p.board, settings.benchmark_meal_plan if p.benchmark_entry is defined and p.benchmark_entry else none) }}{% else %}—{% endif %}</td>
+        <td class="num market">
+          {% if p.market is not none %}{{ money(p.market) }}{% else %}—{% endif %}
+          {% if p.benchmark_entry is defined and p.benchmark_entry %}{{ board_note(settings.benchmark_meal_plan) }}{% endif %}
+          {% if p.usual_gap is not none %}
+            <br><span class="muted">we usually sit {{ '%+.0f'|format((p.usual_gap - 1) * 100) }}%</span>
+            <br><span class="muted">→ {{ money((p.market * p.usual_gap)|round|int) }} keeps it</span>
+          {% endif %}
+          {#- The whole sum, shown. The owner's rule is one subtraction and
+              they should be able to check it at a glance rather than trust
+              that the box below did it right. -#}
+          {% if p.benchmark_entry is defined and p.benchmark_entry %}
+            <br><span class="muted">{{ p.benchmark_entry.room }}</span>
+            <br><span class="muted">− {{ money(settings.benchmark_undercut) }} → {{ money(p.wanted) }}</span>
+          {% endif %}
+          {% if p.demand_note %}<br><span class="muted demand">{{ p.demand_note }}</span>{% endif %}
+        </td>
+        <td class="competitors">
+          {% if p.competitors %}
+            {#
+              CONTEXT, AND UNDER A BENCHMARK ONLY CONTEXT. This list is every
+              hotel in the tier on every site they are tracked on, which is
+              what the median reads. A benchmarked row did not read it -- and
+              the same hotel can appear here at a different price from the
+              one beside it, because that one is pinned to our own site and
+              this one is not. Saying so is the difference between a list and
+              a contradiction.
+            #}
+            <details>
+              <summary>{{ p.competitors|length }} hotel{{ 's' if p.competitors|length != 1 }}{% if p.benchmark %} — not used{% endif %}</summary>
+              {% if p.benchmark %}
+                <p class="muted">Your rate follows {{ p.benchmark }} alone. These are every site's
+                figures for the tier, including {{ p.benchmark }}'s own booking engine, and none
+                of them went into tonight's number.</p>
+              {% endif %}
+              <ul class="plain">
+              {% for c in p.competitors %}
+                <li><span class="num">{{ money(c.price) }}</span> <span class="who">{{ c.hotel }}{% if c.sold_out %} <em class="muted">sold out</em>{% endif %}<small class="muted">{{ c.room }}</small></span></li>
+              {% endfor %}
+              </ul>
+            </details>
+          {% else %}<span class="muted">none in this tier</span>{% endif %}
+        </td>
+        {#
+          THE PROPOSED PRICE IS THE OWNER'S TO CHANGE. It is a guest price,
+          like every other price on this row; Apply converts it to the RMS
+          rate by the channel's ratio, the same as it does the rule's. A
+          room that is not mapped, or has no price of ours to take the
+          ratio from, cannot be applied, so it gets no box.
+        #}
+        {% set ns = namespace(cur=none, base=none, rms_new=none, bounded=none, settled=false, idle=none) %}
+        {% if m and m.anchor_for(p.board or settings.benchmark_meal_plan) and (m.rms_room, m.rate_type_for(m.anchor_for(p.board or settings.benchmark_meal_plan))) in latest_rms %}
+          {% set ns.cur = latest_rms[(m.rms_room, m.rate_type_for(m.anchor_for(p.board or settings.benchmark_meal_plan)))] %}
+        {% endif %}
+        {#
+          ``cur`` is what the cell HOLDS and is what the column shows. ``base``
+          is what the ratio is taken against, and for the few minutes after an
+          Apply they differ: the grid has moved and Booking.com has not, so
+          dividing by today's price against today's rate proposes the same cut
+          twice. See ratio_base in the route.
+        #}
+        {% if m and ns.cur is not none %}
+          {% set ns.base = ratio_base.get((m.rms_room, m.rate_type_for(m.anchor_for(p.board or settings.benchmark_meal_plan))), ns.cur) if ratio_base is defined else ns.cur %}
+        {% endif %}
+        {% if ns.base is not none and p.target is not none and p.our_price %}
+          {% set bounded = rule.within_rms_bounds(rule.to_rms(p.target, p.our_price, ns.base, round_to=settings.round_to, exact=p.exact, with_tax=p.with_tax), floor=m.floor_amount, ceiling=m.ceiling_amount) %}
+          {% set ns.rms_new = bounded[0] %}
+          {% set ns.bounded = bounded[1] %}
+          {#
+            NOTHING TO SAY WHEN THE FOLLOW HAS CAUGHT UP. Sitting a hundred
+            under them, the rule recomputes the same rate every half hour and
+            the row offered a "proposed price" identical to today's, at
+            +0.0%, under a green "will apply" -- furniture for a decision
+            nobody has to make, and an invitation to sign into RMS and write
+            the number already there. The proposal comes back the moment
+            THEY move. See rule.settled for why the threshold is round_to.
+          #}
+          {#- On the PRICES, both freshly fetched. Asking it of the RMS cell
+              asked it of a memory, and a memory said "no change needed" on a
+              row sitting 2,950 above them. -#}
+          {% set ns.settled = rule.settled(p.our_price, p.target, round_to=settings.round_to) %}
+          {% if not ns.settled %}{% set ns.idle = rule.nothing_to_write(ns.cur, ns.base, ns.rms_new, round_to=settings.round_to) %}{% endif %}
+        {% endif %}
+        <td class="num proposed">
+          {% if m and m.is_enabled and p.our_price %}
+            <input type="number" class="proposed-price" min="1" step="1"
+                   data-room-type-id="{{ p.room_type_id }}"
+                   data-room="{{ p.room_name }}"
+                   data-rule="{{ p.target|int if p.target is not none else '' }}"
+                   data-our="{{ p.our_price }}"
+                   data-cur="{{ ns.base if ns.base is not none else '' }}"
+                   data-plan="{{ m.anchor_for(p.board or settings.benchmark_meal_plan) or '' }}"
+                   data-floor="{{ m.floor_amount if m.floor_amount is not none else '' }}"
+                   data-ceiling="{{ m.ceiling_amount if m.ceiling_amount is not none else '' }}"
+                   {#- Whether the rule's own number is an instruction, so the
+                       script converts it to RMS the way to_rms() does. A price
+                       the owner types is always one, exact row or not. -#}
+                   data-exact="{{ '1' if p.exact else '' }}"
+                   data-with-tax="{{ '1' if p.with_tax else '' }}"
+                   value="{{ '' if ns.settled else (p.target|int if p.target is not none else '') }}"
+                   placeholder="type a price" aria-label="Proposed price for {{ p.room_name }}">
+            <br><span class="muted change">{% if ns.settled %}{% elif p.change_pct is not none %}{{ '%+.1f'|format(p.change_pct) }}%{% endif %}</span>
+            {% if p.wanted is not none and p.target is not none and p.wanted != p.target %}
+              <br><span class="muted rule-wanted">rule's own target {{ money(p.wanted) }}, limited by the {{ settings.max_step_pct|float|round|int }}% step</span>
+            {% endif %}
+            <span class="muted by-hand" hidden><br>your price{% if p.target is not none %} (rule: {{ money(p.target) }}){% endif %}</span>
+            {#
+              THIS ROOM ALONE. The two buttons under the table write every
+              room marked "will apply"; this writes one and leaves the rest
+              of tonight's rates untouched. It sits under the price it
+              applies rather than in its own column: the table already
+              scrolls sideways, and a button at the far right of a scrolled
+              row is a button aimed at whichever room the eye has lost.
+            #}
+            <br><button type="button" class="apply-room"
+                    data-room-type-id="{{ p.room_type_id }}"
+                    data-room="{{ p.room_name }}"
+                    {% if not has_rate_app or p.our_price is none %}disabled{% endif %}>Apply this room</button>
+          {% elif p.target is not none %}
+            <strong>{{ money(p.target) }}</strong>
+            {% if p.change_pct is not none %}<br><span class="muted">{{ '%+.1f'|format(p.change_pct) }}%</span>{% endif %}
+          {% else %}—{% endif %}
+        </td>
+        {% if not (benchmark is defined and benchmark) %}
+        {#
+          THE MODEL'S OPINION, FOR READING. It is recorded on each Preview or
+          Apply run and shown here beside the rule's; nothing reads it back,
+          so it cannot reach RMS. A price the owner likes, they type.
+        #}
+        {# Templates reload from disk and the routes do not, so a page served
+           by a process started before ``advice`` existed must still render. #}
+        {% set ai = advice.get(p.room_type_id) if advice is defined else none %}
+        <td class="ai">
+          {#- The model's position on TONIGHT'S market as the page shows it: its own
+              target, and that target after the step cap. -#}
+          {% set pair = ai_wanted.get(p.room_type_id) if ai_wanted is defined else none %}
+          {% if ai and ai.advisor_target is not none %}
+            {% if pair and pair[0] != pair[1] %}
+              <strong>{{ money(pair[0]) }}</strong>
+              <span class="muted">after the {{ settings.max_step_pct|float|round|int }}% step limit: {{ money(pair[1]) }}</span>
+            {% else %}
+              <strong>{{ money(pair[1] if pair else ai.advisor_target) }}</strong>
+            {% endif %}
+            <span class="muted">{{ '%+.1f'|format(ai.advisor_position_pct) }}% vs your usual{% if ai.advisor_confidence is not none %} · {{ (ai.advisor_confidence * 100)|round|int }}% sure{% endif %}</span>
+            {% if ai.rationale %}
+              <details><summary>why</summary>
+                <p class="ai-why">{{ ai.rationale }}</p>
+                {% if ai.key_factors %}<ul class="plain">{% for f in ai.key_factors %}<li>{{ f }}</li>{% endfor %}</ul>{% endif %}
+                <small class="muted">{{ ai.model }}, {{ ai.created_at | localtime }}</small>
+              </details>
+            {% endif %}
+          {% elif ai and ai.error %}
+            <span class="muted">no answer ({{ ai.error }})</span>
+          {% else %}
+            <span class="muted">press Preview to ask</span>
+          {% endif %}
+        </td>
+        {% endif %}
+        <td class="num rms">
+          {% if ns.cur is not none %}
+            {% set anchor_plan = m.anchor_for(p.board or settings.benchmark_meal_plan) %}
+            <span class="rms-plan"><span class="plan">{{ anchor_plan }}</span>
+              {% if ns.settled or ns.idle %}{{ money(ns.cur) }} <span class="muted">{{ 'applied' if ns.idle == 'written' else 'stays' }}</span>
+              <span class="rms-new" hidden>{{ money(ns.rms_new) }}</span>
+              {% else %}{{ money(ns.cur) }} → <strong class="rms-new">{{ money(ns.rms_new) if ns.rms_new is not none else '—' }}</strong>{% endif %}</span>
+            {% if ns.bounded and not ns.settled and not ns.idle %}<br><span class="muted">{{ ns.bounded }}</span>{% endif %}
+            {#
+              THE OTHER PLANS, WITH THEIR NUMBERS. Apply writes CLASSIC's EP
+              and MAP as well as its CP -- it always did -- but the cell said
+              only "the other plans keep their supplement", so the two rows
+              that were about to move were the two nobody could see. A rate
+              this page is going to write is a rate this page should name.
+
+              The sum is the worker's own: today's distance from the anchor,
+              carried over the new anchor, rounded the owner's way. Shown only
+              where the grid has actually been read -- a plan with no reading
+              yet is a row Preview has not opened, not a row that stays put.
+            #}
+            {% if ns.rms_new is not none %}
+              {% for plan in ("EP", "CP", "MAP") %}
+                {% set row_name = m.rate_type_for(plan) %}
+                {% if plan != anchor_plan and row_name and (m.rms_room, row_name) in latest_rms %}
+                  {% set plan_cur = latest_rms[(m.rms_room, row_name)] %}
+                  <br><span class="rms-plan follows"><span class="plan">{{ plan }}</span>
+                    {{ money(plan_cur) }} → <strong>{{ money(rule.follow(ns.rms_new, ns.base, ratio_base.get((m.rms_room, row_name), plan_cur) if ratio_base is defined else plan_cur, round_to=settings.round_to)) }}</strong></span>
+                {% endif %}
+              {% endfor %}
+            {% endif %}
+            <br><span class="muted">{{ anchor_plan }} is the rule's; the others keep today's supplement</span>
+          {% elif m %}
+            <span class="muted">read the grid first (Preview)</span>
+          {% else %}—{% endif %}
+        </td>
+        <td class="num site">
+          {% if ns.cur and ns.rms_new is not none and p.our_price %}
+            {#- Back through the SAME divisor the rate was computed with. Using
+                the remembered cell here instead put the rule's own target back
+                as "guest will see 7,586" -- the price we are trying to leave. -#}
+            <strong class="site-new">{{ money(rule.guest_sees(ns.rms_new, p.our_price, ns.base, with_tax=p.with_tax)|round|int) }}</strong>
+            <br><span class="muted">on Booking.com{% if settings.benchmark_with_tax %}, tax in{% endif %}</span>
+            {% if p.benchmark_entry %}
+              <br><span class="muted site-gap">vs {{ p.benchmark }} {{ money(p.market) }}</span>
+            {% endif %}
+          {% elif m %}
+            <span class="muted">Preview to see</span>
+          {% else %}—{% endif %}
+        </td>
+        <td class="status">
+          {% if p.held %}<span class="tag held">held</span> <span class="muted">{{ p.held }}</span>
+          {#
+            A CAPPED FOLLOW THAT LANDS ABOVE THE HOTEL IT FOLLOWS is still
+            worth applying -- it is a move in the right direction -- but it
+            does NOT do what the rule says, and a green "will apply" with the
+            cap in grey beside it read as though it did. So the row says
+            which it is.
+          #}
+          {% elif ns.settled %}<span class="tag settled">no change needed</span>
+            <span class="muted">already {{ money(settings.benchmark_undercut) }} under {{ p.benchmark }};
+            a proposal returns when they move</span>
+          {% elif ns.idle %}{{ idle_status(ns.idle, ns.cur, p, 'Booking.com') }}
+          {% elif p.target is not none %}{% if p.short_by %}<span class="tag short">applies, still over</span>
+            <span class="muted">{{ money(p.short_by) }} short of {{ p.benchmark }} − {{ money(settings.benchmark_undercut) }};
+            {{ p.capped }}</span>
+          {% else %}<span class="tag ok">will apply</span>{% if p.capped %} <span class="muted">{{ p.capped }}</span>{% endif %}{% endif %}
+          {% else %}—{% endif %}
+        </td>
+      </tr>
+      {#
+        BOOKING.COM AND NOTHING ELSE. The tick says which RMS row Apply
+        writes, and unticking it leaves this room alone. Other websites used
+        to be offered here too, as ticks with a box each; that was a second
+        place to write their rows from. A website is now changed only from
+        its own section below (Agoda), with its own rule, Preview and Apply.
+      #}
+      {% if m and m.is_enabled and p.our_price and m.anchor_for(p.board or settings.benchmark_meal_plan) %}
+      {% set anchor_row = m.rate_type_for(m.anchor_for(p.board or settings.benchmark_meal_plan)) %}
+      <tr class="channels-row" data-room-type-id="{{ p.room_type_id }}">
+        {#- One short of the header when the AI column is gone, which
+            leaves a ragged edge under the last cell. -#}
+        <td colspan="{{ 9 if (benchmark is defined and benchmark) else 10 }}">
+          <div class="channel-picks">
+            <span class="channel-picks-label">Change in RMS:</span>
+            <label class="channel-pick main">
+              <input type="checkbox" class="pick-main" checked data-room-type-id="{{ p.room_type_id }}">
+              <strong>{{ settings.channel }}</strong>
+              <span class="muted">{{ m.rms_room }} › {{ anchor_row }}</span>
+            </label>
+          </div>
+        </td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+
+  {#
+    TWO BUTTONS, ONE JOB. Preview logs in, reads every mapped row on the
+    grid and records what it WOULD set, writing nothing; Apply does the
+    same and writes. Both poll the same status, and both are refused while
+    one is running.
+  #}
+  <form class="panel repricing-run-form" id="repricing-run" data-endpoint="/api/v1/repricing/run" data-round-to="{{ settings.round_to }}">
+    <div class="actions">
+      <button type="button" class="run" data-mode="dry_run" {% if not has_rate_app %}disabled{% endif %}>Preview in RMS (changes nothing)</button>
+      <button type="button" class="run danger" data-mode="manual" {% if not has_rate_app %}disabled{% endif %}
+              data-confirm="Set tonight's proposed rates in RMS now? Every room marked 'will apply' is written.">Apply to RMS now</button>
+      {#
+        THE SWITCH BELONGS WITH THE BUTTONS IT REPLACES. It used to sit in the
+        rule form below, saved by "Save rule" along with nine percentages --
+        so the one control that lets rates move unattended was the easiest
+        thing on the page to change by accident, and the hardest to find on
+        purpose. Here it reads as the third choice beside Preview and Apply,
+        which is what it is: do nothing, do it now, or do it every half hour.
+
+        It saves ITSELF, immediately, to its own endpoint. Nothing else on
+        this row is sent with it and Save rule no longer touches it.
+      #}
+      <button type="button" class="auto-toggle{% if settings.auto_enabled %} on{% endif %}"
+              id="auto-toggle" role="switch"
+              aria-checked="{{ 'true' if settings.auto_enabled else 'false' }}"
+              data-endpoint="/api/v1/repricing/automatic"
+              {% if not has_rate_app %}disabled{% endif %}
+              data-confirm-on="Apply the proposals automatically, every 30 minutes, without asking?&#10;&#10;Rates will move with nobody watching, every time {{ benchmark.name if benchmark is defined and benchmark else 'the market' }} moves — there is no daily limit. The step cap bounds each move and the room's RMS floor and ceiling still hold.">
+        <span class="auto-track" aria-hidden="true"><span class="auto-knob"></span></span>
+        <span class="auto-label">Automatic<small>{% if settings.auto_enabled %}on — every 30 minutes{% else %}off — nothing moves by itself{% endif %}</small></span>
+      </button>
+    </div>
+    <p class="muted run-note">Preview signs in and reads every mapped row without changing anything. Apply does the same and writes the rates marked <em>will apply</em>. Change a <em>Proposed price</em> to set your own: it is the price guests should see on the site, and Apply turns it into the RMS rate shown beside it. A price you type skips the rule's step and percentage limits, not the room's RMS floor and ceiling. Each opens the rate application in a browser here and takes about a minute.</p>
+    {% if not has_rate_app %}
+    <p class="muted">Save the login on the <a href="/rate-application">Rate app</a> page first.</p>
+    {% endif %}
+    <p class="form-status" role="status" hidden></p>
+  </form>
+</section>
+
+{#
+  THE SAME RULE ON OTHER WEBSITES.
+  Booking.com above follows the benchmark on Booking.com. Each section here
+  follows it on another website -- Agoda against their Agoda price, Goibibo
+  against their Goibibo price -- and writes that website's row in RMS. The
+  two are not one number (Competitor A's Classic Room was 7,399 on Booking.com
+  and 3,685 on Agoda the same night), which is why each has its own gap,
+  rooms, buttons and automatic switch.
+
+  Different from the ticks under each room above: a tick writes another
+  channel by the same share Booking.com moved, once, by hand. A section here
+  is a rule of its own, priced off its own site.
+#}
+{% if lanes is defined %}
+<section class="repricing-section lanes">
+  <h2>Agoda, Goibibo and other websites</h2>
+  <p class="muted">
+    The same rule on another website: {{ benchmark.name if benchmark else 'the hotel you follow' }}'s
+    price <strong>on that website</strong>, less your gap, written to that website's row in RMS.
+    Each website has its own Preview, Apply and automatic switch, and nothing moves until you use them.
+  </p>
+  {% if not benchmark %}
+    <p class="panel">Choose the hotel to follow first. These rules price against it and have nothing to follow without it.</p>
+  {% endif %}
+
+  {% for L in lanes %}
+  {% set r = L.rule %}
+  {% set enc = r.channel|urlencode %}
+  <div class="panel lane" data-channel="{{ r.channel }}">
+    <h3>{{ r.channel }}
+      <small class="muted">· prices read from {{ r.source.display_name if r.source else 'site ' ~ r.source_id }}
+      · {{ money(r.benchmark_undercut) }} under {{ benchmark.name if benchmark else '—' }}{% if r.benchmark_with_tax %}, tax in{% endif %}
+      {% if r.benchmark_meal_plan %} · {{ r.benchmark_meal_plan|lower }}{% endif %}</small></h3>
+
+    {% if not L.proposals %}
+      <p class="muted">No proposals yet: no prices on {{ r.source.display_name if r.source else 'this site' }} for tonight,
+      or no room is paired below. Prices appear after the site's next check of your hotel and {{ benchmark.name if benchmark else 'theirs' }}.</p>
+    {% else %}
+    <div class="grid-wrap">
+    <table class="grid">
+      <thead><tr>
+        <th>Room</th>
+        <th class="num">Our price{% if r.benchmark_with_tax %} <small class="muted">with tax</small>{% endif %}</th>
+        <th class="num">{{ benchmark.name if benchmark else 'Them' }}{% if r.benchmark_with_tax %} <small class="muted">with tax</small>{% endif %}</th>
+        <th class="num">Proposed price</th>
+        <th class="num">In RMS ({{ r.channel }})</th>
+        <th class="num">Guest will see</th>
+        <th>Status</th>
+      </tr></thead>
+      <tbody>
+      {% for p in L.proposals %}
+        <tr class="{{ 'held' if p.held else ('ok' if p.target is not none else '') }}">
+          {{ lane_cells(L, p) }}
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% endif %}
+
+    <form class="lane-run-form" data-endpoint="/api/v1/repricing/run" data-channel="{{ r.channel }}">
+      <div class="actions">
+        <button type="button" class="run" data-mode="dry_run" {% if not has_rate_app %}disabled{% endif %}>Preview {{ r.channel }} in RMS (changes nothing)</button>
+        <button type="button" class="run danger" data-mode="manual" {% if not has_rate_app %}disabled{% endif %}
+                data-confirm="Set tonight's {{ r.channel }} rates in RMS now? Every {{ r.channel }} room marked 'will apply' is written. Booking.com is not touched.">Apply {{ r.channel }} to RMS now</button>
+        <button type="button" class="auto-toggle{% if r.auto_enabled %} on{% endif %}" role="switch"
+                aria-checked="{{ 'true' if r.auto_enabled else 'false' }}"
+                data-endpoint="/api/v1/repricing/channels/{{ enc }}/automatic"
+                {% if not has_rate_app %}disabled{% endif %}
+                data-confirm-on="Set {{ r.channel }} automatically, every 30 minutes, without asking?&#10;&#10;{{ r.channel }}'s rates will follow {{ benchmark.name if benchmark else 'the hotel you follow' }}'s {{ r.channel }} price with nobody watching. The step cap bounds each move and each room's RMS floor and ceiling still hold.">
+          <span class="auto-track" aria-hidden="true"><span class="auto-knob"></span></span>
+          <span class="auto-label">Automatic<small>{% if r.auto_enabled %}on — every 30 minutes{% else %}off — nothing moves by itself{% endif %}</small></span>
+        </button>
+      </div>
+      <p class="form-status" role="status" hidden></p>
+    </form>
+
+    <details class="lane-settings">
+      <summary>{{ r.channel }} settings: website, gap and rooms</summary>
+      <form class="api-form lane-form" data-endpoint="/api/v1/repricing/channels/{{ enc }}" data-method="PUT">
+        <div class="lane-fields">
+          <label>Prices from
+            <select name="source_id">
+              {% for s in lane_sources %}<option value="{{ s.id }}" {% if s.id == r.source_id %}selected{% endif %}>{{ s.display_name }}</option>{% endfor %}
+            </select></label>
+          <label>Gap ₹ under them <input type="number" name="benchmark_undercut" min="0" step="1" value="{{ r.benchmark_undercut|int }}"></label>
+          <label><input type="checkbox" name="benchmark_with_tax" value="true" {% if r.benchmark_with_tax %}checked{% endif %}> Measured on the price with tax</label>
+          <label>Meal plan to compare
+            <select name="benchmark_meal_plan">
+              <option value="" {% if not r.benchmark_meal_plan %}selected{% endif %}>Cheapest of each room (the site does not say)</option>
+              {% for plan in ("Room Only", "Breakfast", "Breakfast and Dinner") %}
+                <option value="{{ plan }}" {% if r.benchmark_meal_plan == plan %}selected{% endif %}>{{ plan }}</option>
+              {% endfor %}
+            </select></label>
+        </div>
+        <table class="grid lane-pairs">
+          <thead><tr><th>Your room (RMS row)</th><th>Called on this website</th><th>Competes with their</th></tr></thead>
+          <tbody>
+          {% for room in rooms if mappings.get(room.id) %}
+            {% set pair = (r.room_pairs or {}).get(room.id|string) or {} %}
+            <tr>
+              <td><strong>{{ room.name }}</strong><br><span class="muted">{{ mappings[room.id].rms_room }}</span></td>
+              <td><select class="lane-pair" data-room-type-id="{{ room.id }}" data-side="ours">
+                <option value="">same name ({{ room.name }})</option>
+                {% for n in L.our_names %}{% if n != room.name %}<option value="{{ n }}" {% if pair.ours == n %}selected{% endif %}>{{ n }}</option>{% endif %}{% endfor %}
+                {% if pair.ours and pair.ours not in L.our_names %}<option value="{{ pair.ours }}" selected>{{ pair.ours }} (not seen lately)</option>{% endif %}
+              </select></td>
+              <td><select class="lane-pair" data-room-type-id="{{ room.id }}" data-side="theirs">
+                <option value="">not paired — leave this room alone</option>
+                {% for n in L.their_names %}<option value="{{ n }}" {% if pair.theirs == n %}selected{% endif %}>{{ n }}</option>{% endfor %}
+                {% if pair.theirs and pair.theirs not in L.their_names %}<option value="{{ pair.theirs }}" selected>{{ pair.theirs }} (not seen lately)</option>{% endif %}
+              </select></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        <input type="hidden" name="room_pairs" data-json value="{}">
+        <p class="muted">The room names are the ones this website has shown in the last two weeks. A room with no pair is left alone on {{ r.channel }}.</p>
+        <button type="submit" class="small">Save {{ r.channel }} settings</button>
+        <span class="form-status" role="status"></span>
+      </form>
+      <form class="api-form" data-endpoint="/api/v1/repricing/channels/{{ enc }}" data-method="DELETE"
+            data-confirm="Stop following {{ benchmark.name if benchmark else 'them' }} on {{ r.channel }}? Its rates in RMS stay as they are.">
+        <button type="submit" class="small danger">Remove the {{ r.channel }} rule</button>
+        <span class="form-status" role="status"></span>
+      </form>
+    </details>
+  </div>
+  {% endfor %}
+
+  {#- Adding one: the RMS channel and the website its prices come from.
+      Created with the room pairs of the main rule as a starting point, and
+      switched off. -#}
+  <form class="panel api-form lane-add" id="lane-add" data-endpoint="/api/v1/repricing/channels/" data-method="PUT">
+    <strong>Follow {{ benchmark.name if benchmark else 'them' }} on another website</strong>
+    <div class="lane-fields">
+      <label>RMS channel
+        {% if unruled_channels %}
+          <select class="lane-add-channel">
+            {% for c in unruled_channels %}<option value="{{ c }}" {% if c in ('Agoda', 'Goibibo') %}selected{% endif %}>{{ c }}</option>{% endfor %}
+          </select>
+        {% else %}
+          <input type="text" class="lane-add-channel" placeholder="Agoda" data-text>
+        {% endif %}
+      </label>
+      <label>Prices from
+        <select name="source_id">
+          {% for s in lane_sources %}<option value="{{ s.id }}" {% if 'agoda' in s.code %}selected{% endif %}>{{ s.display_name }}</option>{% endfor %}
+        </select></label>
+      <label>Gap ₹ <input type="number" name="benchmark_undercut" min="0" step="1" value="{{ settings.benchmark_undercut|int }}"></label>
+    </div>
+    <input type="hidden" name="room_pairs" data-json value="{}">
+    <input type="hidden" name="benchmark_with_tax" value="true">
+    <button type="submit" class="small">Add</button>
+    <span class="form-status" role="status"></span>
+    <p class="muted">It starts switched off, with no rooms paired: choose them under its settings, press Preview, then Apply.</p>
+  </form>
+</section>
+{% endif %}
+
+{#
+  THE RULE'S SETTINGS ARE NOT ON THIS PAGE.
+  There is one rule -- a fixed sum under one named hotel -- and a panel of
+  nine boxes for shaping a rule nobody is running was the page's largest
+  thing and its least used. What the rule IS still shows on every row: the
+  hotel's name, their price, "- Rs 100", and the number it gives.
+
+  The settings themselves are unchanged and still served and saved by
+  ``PUT /api/v1/repricing/settings``; only this form is gone. It was put
+  back on 23 Sep 2026 and taken off again the same day -- the panel is not
+  wanted here, and the page is meant to read as one rule with an Apply
+  button and an automatic switch. The markup is in the history, at
+  ``git show d0be655``. NOT at .local/removed-rule-section.html, which this
+  comment used to point at: that path is gitignored, so it is one laptop's
+  file and has never existed on the server.
+
+  WHAT ITS ABSENCE COSTS, SINCE IT HAS NOW COST IT TWICE. Nothing anywhere
+  sets the benchmark hotel, the gap, the room pairs or the board, so a fresh
+  deployment gets the median rule and no way off it. Production ran a full
+  day with ``benchmark_hotel_id`` NULL while the dev box had Competitor A: the
+  same commit on both machines and a page that looked nothing alike, which
+  reads as code drift and is not. Setting it takes either a GET-merge-PUT
+  against the endpoint above -- it is a full replace, and an omitted field
+  reverts to its schema default -- or an UPDATE on repricing_settings. If
+  this bites a third time, move the controls to /settings rather than back
+  onto this page.
+#}
+<section class="repricing-section">
+  <h2>Room mapping</h2>
+  <p class="muted">
+    Which row of RMS each of your rooms is. The booking site and RMS name rooms
+    differently (Booking.com's "Deluxe Double Room" is RMS's CLASSIC), so a repricer
+    that guessed would write the right number on the wrong room. Leave a rate row
+    blank if that plan is not sold on the channel; floor and ceiling are RMS rates.
+  </p>
+  {#
+    ONE GRID, ONE FORM PER ROW. A <form> cannot wrap a table row, so this is
+    a CSS grid and each form is ``display: contents`` -- its cells sit in
+    the grid while the form stays the element the api-form handler reads.
+  #}
+  <div class="panel mapping-grid">
+    <div class="mapping-head">Your room</div>
+    <div class="mapping-head">RMS room type</div>
+    <div class="mapping-head">EP row</div>
+    <div class="mapping-head">CP row</div>
+    <div class="mapping-head">MAP row</div>
+    <div class="mapping-head">Floor ₹</div>
+    <div class="mapping-head">Ceiling ₹</div>
+    <div class="mapping-head mapping-on">On</div>
+    <div class="mapping-head"></div>
+    {% for room in rooms %}
+      {% set m = mappings.get(room.id) %}
+      <form class="api-form mapping-row" data-endpoint="/api/v1/repricing/mappings/{{ room.id }}" data-method="PUT">
+        <div class="mapping-name"><strong>{{ room.name }}</strong></div>
+        <div><input type="text" name="rms_room" data-text required placeholder="CLASSIC" value="{{ m.rms_room if m else '' }}"></div>
+        <div><input type="text" name="rate_type_ep" data-text placeholder="—" value="{{ m.rate_type_ep or '' if m else '' }}"></div>
+        <div><input type="text" name="rate_type_cp" data-text placeholder="—" value="{{ m.rate_type_cp or '' if m else '' }}"></div>
+        <div><input type="text" name="rate_type_map" data-text placeholder="—" value="{{ m.rate_type_map or '' if m else '' }}"></div>
+        <div><input type="number" name="floor_amount" min="0" step="1" placeholder="none" value="{{ m.floor_amount|int if m and m.floor_amount is not none else '' }}"></div>
+        <div><input type="number" name="ceiling_amount" min="0" step="1" placeholder="none" value="{{ m.ceiling_amount|int if m and m.ceiling_amount is not none else '' }}"></div>
+        <div class="mapping-on"><input type="checkbox" name="is_enabled" value="true" title="Reprice this room" {% if not m or m.is_enabled %}checked{% endif %}></div>
+        <div class="mapping-save">
+          <button type="submit" class="small">{{ 'Save' if m else 'Map' }}</button>
+          <span class="form-status" role="status"></span>
+        </div>
+      </form>
+    {% endfor %}
+  </div>
+</section>
+{% endif %}
+{% endblock %}

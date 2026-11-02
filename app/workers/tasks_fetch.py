@@ -1,0 +1,1041 @@
+"""The scheduler sweep and the price fetch.
+
+Two tasks, and a hard rule between them: **a failure inside ``fetch_prices``
+never escapes it**. The blast radius of anything going wrong at one hotel is
+that hotel. It writes a ``monitoring_errors`` row, marks its check run failed,
+and returns normally — beat keeps ticking and the other twenty-nine hotels are
+untouched.
+
+The transaction discipline is equally deliberate. The database session is
+opened, used, and closed BEFORE the fetch, and opened again after it. A browser
+fetch takes 20-40 seconds; holding a transaction across it would pin a
+connection per in-flight hotel and Postgres would start refusing new ones long
+before the browsers ran out.
+"""
+from __future__ import annotations
+
+import random
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from celery import shared_task
+from celery.exceptions import SoftTimeLimitExceeded
+from sqlalchemy import select
+
+from app.adapters import registry
+from app.adapters.base import FetchContext, FetchResult, NormalizedOffer
+from app.config import get_settings
+from app.core.errors import (
+    ErrorClass,
+    FetchError,
+    SchemaDriftError,
+    TimeoutError_,
+    classify,
+)
+from app.core.logging import get_logger
+from app.core.ratelimit import (
+    LockNotAcquired,
+    dispatch_lock,
+    effective_rate_per_min,
+    penalise_source,
+    take_token,
+)
+from app.db.models import CheckRun, CheckRunStatus, Hotel, MonitorTarget, PriceBasis
+from app.db.session import sync_session
+from app.services import monitoring
+from app.services.dates import StayWindow, local_today, rollover_window
+from app.services.ingest import IngestContext, ingest_fetch_result
+from app.services.monitoring import DueGroup
+
+log = get_logger("tasks.fetch")
+
+#: How long the per-group lock is held. Twice the task time limit, so a worker
+#: that is killed mid-fetch cannot leave a lock that outlives the next window.
+_LOCK_TTL_SECONDS = 600
+
+#: Backoff per attempt, seconds, before jitter. Long on purpose: a site that
+#: just failed is not helped by three requests in thirty seconds.
+_BACKOFF = (30, 120, 480)
+
+#: How long before a schema-drift reading is checked on a fresh page load. Long
+#: enough that a slow booking engine has finished whatever held it up, short
+#: enough that a real redesign still reaches Attention (and repair) within
+#: two minutes of the first sighting. See _handle_failure.
+_DRIFT_CONFIRM_SECONDS = 60
+
+#: How long a queued check stays worth running. Half an hour, matching the
+#: shortest interval anyone schedules; past that the answer it would collect is
+#: about a moment that has gone.
+_STALE_AFTER_SECONDS = 1800
+
+
+# -- serialisation ---------------------------------------------------
+# Groups cross the broker as plain JSON. Sending ORM objects (or pickles)
+# would mean a worker running older code could not deserialise a message from
+# a newer scheduler — a failure that only shows up mid-deploy.
+def group_to_payload(group: DueGroup) -> dict[str, Any]:
+    return {
+        "hotel_id": group.hotel_id,
+        "hotel_name": group.hotel_name,
+        "hotel_source_id": group.hotel_source_id,
+        "source_id": group.source_id,
+        "adapter_key": group.adapter_key,
+        "url": group.url,
+        "external_id": group.external_id,
+        "currency": group.currency,
+        "adapter_config": group.adapter_config,
+        "check_in": group.stay.check_in.isoformat(),
+        "check_out": group.stay.check_out.isoformat(),
+        "adults": group.adults,
+        "children": group.children,
+        "rooms": group.rooms,
+        "meal_plan_filter": group.meal_plan_filter,
+        "target_ids": list(group.target_ids),
+        "rate_limit_per_min": group.rate_limit_per_min,
+    }
+
+
+def _stay_from_payload(payload: dict[str, Any]) -> StayWindow:
+    return StayWindow(
+        check_in=datetime.fromisoformat(payload["check_in"]).date(),
+        check_out=datetime.fromisoformat(payload["check_out"]).date(),
+    )
+
+
+# -- the sweep -------------------------------------------------------
+@shared_task(name="monitor.dispatch_due_checks", ignore_result=True)
+def dispatch_due_checks() -> dict[str, int]:
+    """Find what is due and enqueue it. Runs every 60 seconds.
+
+    ``next_run_at`` is advanced here rather than when the fetch completes: a
+    task that hangs would otherwise leave its target permanently due and every
+    subsequent sweep would enqueue it again.
+    """
+    settings = get_settings()
+    now = datetime.now(UTC)
+    enqueued = 0
+
+    with sync_session() as session:
+        groups = monitoring.find_due_groups(session, now)
+        for group in groups:
+            countdown = random.uniform(0, settings.dispatch_jitter_seconds)
+            fetch_prices.apply_async(
+                args=[group_to_payload(group)],
+                queue=group.queue,
+                countdown=countdown,
+                # Nothing useful comes of running a check that has been sitting
+                # in the queue longer than the interval it belongs to.
+                #
+                # A DEADLINE, NOT A CLOCK READING. Celery reads a bare number
+                # here as "seconds from now" (see AMQP.as_task_v2), so passing
+                # a POSIX timestamp asked for an expiry 1.79 billion seconds —
+                # about 56 years — away, and the guard never once fired. That
+                # is how checks queued before a two-day outage came back and
+                # ran against a check-in date already in the past, each one
+                # reading an empty page and reporting it as a site redesign.
+                expires=now + timedelta(seconds=_STALE_AFTER_SECONDS),
+            )
+            monitoring.schedule_next_run(session, group.target_ids, now)
+            enqueued += 1
+
+    if enqueued:
+        log.info("dispatched", groups=enqueued)
+    return {"groups": enqueued}
+
+
+# -- the fetch -------------------------------------------------------
+@shared_task(
+    bind=True,
+    name="fetch.prices",
+    max_retries=3,
+    ignore_result=True,
+)
+def fetch_prices(self, payload: dict[str, Any], triggered_by: str = "scheduler",
+                 check_run_id: str | None = None) -> dict[str, Any]:
+    """Fetch one hotel's prices for one stay window and ingest the result."""
+    stay = _stay_from_payload(payload)
+    target_ids: list[int] = payload["target_ids"]
+    check_run_id = check_run_id or str(uuid.uuid4())
+    started = datetime.now(UTC)
+
+    # Bound once so every line from this fetch carries the hotel and run id.
+    # Correlating a failure to a check run is otherwise guesswork when thirty
+    # hotels are logging into the same stream.
+    logger = log.bind(
+        hotel=payload["hotel_name"],
+        hotel_source_id=payload["hotel_source_id"],
+        check_in=payload["check_in"],
+        check_run_id=check_run_id,
+    )
+
+    # A window that has already begun is not worth a page load, and reading one
+    # is worse than reading nothing: a booking site asked for a date in the past
+    # renders no rooms, which every adapter correctly sees as "no room_card
+    # matched" and reports as a redesign. Five of those in a row open the
+    # circuit, so a stale message does not merely waste a fetch — it takes the
+    # hotel off monitoring and buries the real config under a false alarm.
+    #
+    # The expiry set at dispatch is the first line of defence, but it is a
+    # best-effort broker feature: a retry, a replayed message, or a queue that
+    # survived an outage can all still arrive here. This is the one that holds.
+    if stay.check_in < local_today(get_settings().timezone):
+        _write_check_run(
+            check_run_id, payload, stay, started, CheckRunStatus.SKIPPED,
+            triggered_by=triggered_by,
+            error_summary=(
+                f"Stay window {stay} has already started; a check for a past "
+                f"date cannot return a bookable rate."
+            ),
+        )
+        logger.info("fetch_skipped_stale", check_in=stay.check_in.isoformat())
+        return {"status": "skipped", "why": "stale", "check_run_id": check_run_id}
+
+    try:
+        with dispatch_lock(f"lock:{_lock_name(payload)}", _LOCK_TTL_SECONDS):
+            return _run_fetch(self, payload, stay, target_ids, check_run_id,
+                              triggered_by, started, logger)
+    except LockNotAcquired:
+        # The previous run of this exact group is still going. Skipping is
+        # correct: two browsers at one hotel is both impolite and pointless.
+        _write_check_run(
+            check_run_id, payload, stay, started, CheckRunStatus.SKIPPED,
+            triggered_by=triggered_by,
+            error_summary="A previous check for this hotel and stay window was still running.",
+        )
+        log.info("fetch_skipped_locked", hotel=payload["hotel_name"])
+        return {"status": "skipped", "check_run_id": check_run_id}
+
+
+def _run_fetch(
+    task,
+    payload: dict[str, Any],
+    stay: StayWindow,
+    target_ids: list[int],
+    check_run_id: str,
+    triggered_by: str,
+    started: datetime,
+    logger,
+) -> dict[str, Any]:
+    settings = get_settings()
+
+    # Politeness budget first: no point opening a browser we are not allowed
+    # to use yet.
+    rate = effective_rate_per_min(payload["source_id"], payload["rate_limit_per_min"])
+    verdict = take_token(payload["source_id"], rate)
+    if not verdict.allowed:
+        logger.info("rate_limited_deferring", wait_s=round(verdict.retry_after_seconds, 1))
+        raise task.retry(countdown=verdict.retry_after_seconds, max_retries=5)
+
+    _write_check_run(check_run_id, payload, stay, started, CheckRunStatus.RUNNING,
+                     triggered_by=triggered_by)
+
+    context = _context_for(payload, stay, settings, check_run_id)
+
+    # No database session is held across this call. It is the slow part.
+    try:
+        adapter = registry.get_adapter(payload["adapter_key"])
+        result: FetchResult = adapter.fetch(context)
+    except SoftTimeLimitExceeded:
+        # Celery raises this in the task's own thread at the soft limit. Caught
+        # separately from the generic handler because it is not an exception
+        # the adapter raised, and classify() would file it as unknown.
+        return _handle_failure(
+            task, TimeoutError_("The fetch exceeded its time limit"),
+            payload, stay, target_ids, check_run_id, started, triggered_by, logger,
+        )
+    except Exception as exc:  # noqa: BLE001 - classified, never propagated
+        return _handle_failure(
+            task, classify(exc), payload, stay, target_ids, check_run_id,
+            started, triggered_by, logger,
+        )
+
+    readings = _with_rollover(
+        adapter, payload, stay, result,
+        settings=settings, check_run_id=check_run_id, logger=logger,
+    )
+    return _ingest(readings, payload, target_ids, check_run_id, started,
+                   triggered_by, logger)
+
+
+# -- a full hotel is not an empty page -------------------------------
+#: One reading: the window that was asked for, and what the source said about
+#: it. A run produces one of these normally, and two when a full night was
+#: rolled forward.
+Reading = tuple[StayWindow, FetchResult]
+
+
+def _context_for(
+    payload: dict[str, Any], stay: StayWindow, settings, check_run_id: str
+) -> FetchContext:
+    """Everything the adapter needs, for ONE stay window.
+
+    Lifted out of _run_fetch so the rolled-forward window is built the same
+    way as the requested one. Locale, timezone and currency are pinned for the
+    reason FetchContext documents: two readings taken under different
+    conditions are not comparable, and the second reading here is going to be
+    compared against the first hotel's rates like any other.
+    """
+    return FetchContext(
+        hotel_source_id=payload["hotel_source_id"],
+        hotel_name=payload["hotel_name"],
+        url=payload["url"],
+        external_id=payload["external_id"],
+        stay=stay,
+        adults=payload["adults"],
+        children=payload["children"],
+        rooms=payload["rooms"],
+        currency=payload["currency"],
+        locale=settings.browser_locale,
+        timezone=settings.browser_timezone,
+        config=payload["adapter_config"],
+        check_run_id=check_run_id,
+    )
+
+
+def _has_rooms(result: FetchResult) -> bool:
+    """Whether anything on this reading can actually be booked.
+
+    Not ``bool(result.offers)``: an eZee page that lists three room types and
+    prints "Not Available" under each has three offers and nothing for sale.
+    """
+    return any(offer.is_available for offer in result.offers)
+
+
+def _rollover_target(
+    result: FetchResult, stay: StayWindow, *, today, horizon_days: int
+) -> StayWindow | None:
+    """The window to check instead, when this one came back full.
+
+    ``sold_out_detected`` is required, not merely "no offers". An empty result
+    the adapter could not explain is drift and has already raised by the time
+    it gets here — but if one ever arrives quietly, rolling forward would hide
+    a broken selector behind a night of prices from a different date, which is
+    precisely the failure this system refuses to make.
+    """
+    if _has_rooms(result) or not result.sold_out_detected:
+        return None
+    return rollover_window(stay, today=today, horizon_days=horizon_days)
+
+
+def _with_rollover(
+    adapter,
+    payload: dict[str, Any],
+    stay: StayWindow,
+    result: FetchResult,
+    *,
+    settings,
+    check_run_id: str,
+    logger,
+) -> list[Reading]:
+    """Read the next night too, when the night asked for is sold out.
+
+    A hotel with no rooms tonight still publishes a rate for tomorrow, and on
+    a full evening that rate is the only live number in the market. Before
+    this, such an evening produced nothing at all: no prices, and — until the
+    phrase was added to the marker list — a redesign alert for a page that was
+    working exactly as designed.
+
+    Both readings are kept and both are ingested, each under ITS OWN absolute
+    dates. The sold-out for the requested night is a business fact and is
+    recorded as one; the rolled night's prices are filed against the rolled
+    night. Substituting one for the other would put tomorrow's rate in
+    tonight's series and report a price move that never happened — the trap
+    services/dates.py opens with.
+
+    The extra reading is strictly a bonus. It costs a rate-limit token, and if
+    the budget says no, or the second page fails for any reason at all, the
+    first reading is returned alone: a fetch that succeeded must never be
+    turned into a failure by the optional half. A drift on the rolled window
+    is logged rather than filed, because the requested window checks the same
+    page on its own schedule and will raise it there, against the dates an
+    operator was actually asking about.
+    """
+    readings: list[Reading] = [(stay, result)]
+
+    nxt = _rollover_target(
+        result, stay,
+        today=local_today(settings.browser_timezone),
+        horizon_days=settings.sold_out_rollover_days,
+    )
+    if nxt is None:
+        return readings
+
+    # UNDER THE ROLLED NIGHT'S OWN LOCK, not the one this task already holds.
+    #
+    # The lock this task entered is keyed on the window that was ASKED for, so
+    # it says nothing about the night the roll goes on to read -- and a second
+    # target watching that night has a different key and is free to run at the
+    # same moment. Two browsers would then land on one hotel, which is the
+    # thing the lock exists to prevent, and both would try to INSERT the same
+    # price_series row: offer_key is its primary key, so one of the two whole
+    # fetches would abort on the unique violation. Even when the row already
+    # exists they would both advance the same debounce counter, confirming a
+    # change on a single real sighting.
+    #
+    # Not acquiring it is a perfectly good outcome: somebody else is already
+    # reading that night, and their reading is the one to keep.
+    try:
+        with dispatch_lock(f"lock:{_lock_name(payload, nxt)}", _LOCK_TTL_SECONDS):
+            rate = effective_rate_per_min(payload["source_id"], payload["rate_limit_per_min"])
+            if not take_token(payload["source_id"], rate).allowed:
+                logger.info("rollover_skipped_rate_limited", rolled_to=str(nxt))
+                return readings
+            rolled = adapter.fetch(_context_for(payload, nxt, settings, check_run_id))
+    except LockNotAcquired:
+        logger.info("rollover_skipped_locked", rolled_to=str(nxt))
+        return readings
+    except Exception as exc:  # noqa: BLE001 - never fails the reading we have
+        logger.info("rollover_fetch_failed", rolled_to=str(nxt), error=str(exc)[:200])
+        return readings
+
+    logger.info(
+        "rolled_past_a_sold_out_night",
+        sold_out=str(stay),
+        rolled_to=str(nxt),
+        offers=len(rolled.offers),
+    )
+    readings.append((nxt, rolled))
+    return readings
+
+
+def _nights(stay: StayWindow) -> str:
+    return f"{stay.check_in:%d %b} → {stay.check_out:%d %b}"
+
+
+def _sold_out_note(readings: list[Reading]) -> str | None:
+    """The sentence on the run, when the night asked for had no rooms.
+
+    ``None`` for an ordinary run: a note that appears on every row is one
+    nobody reads.
+    """
+    stay, result = readings[0]
+    if _has_rooms(result) or not result.sold_out_detected:
+        return None
+
+    asked = _nights(stay)
+    if len(readings) == 1:
+        return f"No available rooms for {asked}."
+
+    rolled_stay, rolled = readings[1]
+    rolled_nights = _nights(rolled_stay)
+    if not _has_rooms(rolled):
+        return (
+            f"No available rooms for {asked}, and none for {rolled_nights} "
+            f"either — this hotel is sold out on both nights."
+        )
+    on_sale = sum(1 for offer in rolled.offers if offer.is_available)
+    return (
+        f"No available rooms for {asked}, so the next night was checked "
+        f"instead: {on_sale} room(s) on sale for {rolled_nights}."
+    )
+
+
+def _ingest(
+    readings: list[Reading],
+    payload: dict[str, Any],
+    target_ids: list[int],
+    check_run_id: str,
+    started: datetime,
+    triggered_by: str,
+    logger,
+) -> dict[str, Any]:
+    """Persist the offers and hand any confirmed changes to the notify queue.
+
+    ``readings`` is normally one window. It is two when a sold-out night was
+    rolled forward, and each is ingested under its own absolute dates in the
+    SAME transaction: the sold-out and the substitute reading are one fact
+    about one moment, and committing half of them would leave a night marked
+    unavailable with nothing to show for the check that found it.
+    """
+    now = datetime.now(UTC)
+    requested_stay = readings[0][0]
+    offers_found = offers_unmatched = 0
+    change_ids: list[int] = []
+    collapsed_names: list[str] = []
+    # Whether ANY window in this run looked like a broken selector rather
+    # than a site selling one room on two plans. Gates the repair below,
+    # which drives a real browser against somebody else's page.
+    selector_suspect = False
+
+    with sync_session() as session:
+        target = session.execute(
+            select(MonitorTarget).where(MonitorTarget.id == target_ids[0])
+        ).scalar_one_or_none()
+
+        for stay, result in readings:
+            ctx = IngestContext(
+                hotel_id=payload["hotel_id"],
+                source_id=payload["source_id"],
+                hotel_source_id=payload["hotel_source_id"],
+                stay=stay,
+                adults=payload["adults"],
+                children=payload["children"],
+                currency=payload["currency"],
+                # Configured, not assumed: see Settings.price_basis. A series
+                # recorded on the other basis is rebased by the ingest layer
+                # rather than reported as a price move.
+                price_basis=PriceBasis(get_settings().price_basis),
+                # The target can be deleted between dispatch and ingest. The
+                # observations are still worth keeping, so fall back to the
+                # global sensitivity rather than discarding the fetch.
+                thresholds=(
+                    monitoring.build_thresholds(target)
+                    if target is not None
+                    else monitoring.default_thresholds()
+                ),
+                checked_at=now,
+                check_run_id=check_run_id,
+                meal_plan_filter=payload.get("meal_plan_filter"),
+            )
+            summary = ingest_fetch_result(session, result, ctx)
+
+            offers_found += summary.offers_seen
+            offers_unmatched += summary.offers_unmatched
+            change_ids.extend(summary.change_ids)
+            collapsed_names.extend(summary.collapsed_names)
+            selector_suspect = selector_suspect or summary.name_selector_looks_broken
+
+            # A fetch that read several rooms and could only file one of them
+            # is a SUCCESS by every measure this task has -- the page loaded,
+            # the selectors matched, offers were found and none went unmatched
+            # -- and it is still wrong. It means the room_name selector has
+            # landed on something every card shares, so the hotel's rooms all
+            # arrive with one identity and the pipeline keeps the first.
+            #
+            # That happened to a six-room property whose name selector found an
+            # amenity chip reading "King Size Bed" on all six cards. Nothing
+            # failed, nothing was retried, and the dashboard showed one room for
+            # weeks. Recorded here so the next occurrence is a line on Attention
+            # rather than a discrepancy somebody happens to notice.
+            # ONLY WHEN THE COLLISIONS ACCUSE THE SELECTOR. A hotel that sells
+            # one room under two rate plans the page does not distinguish
+            # collapses a couple of offers out of a list that is otherwise full
+            # of distinct names, and there is nothing for anybody to fix -- see
+            # IngestSummary.name_selector_looks_broken for the two cases and
+            # what separates them.
+            if summary.name_selector_looks_broken:
+                monitoring.record_error(
+                    session,
+                    error=SchemaDriftError(
+                        f"{summary.offers_collapsed} of {summary.offers_seen} offers "
+                        f"shared an identity with another offer in the same fetch "
+                        f"AT A DIFFERENT PRICE, so the cheaper or dearer of each "
+                        f"pair was dropped and this hotel is being monitored as "
+                        f"{summary.offers_matched - summary.offers_collapsed} room(s). "
+                        f"Most of the fetch collapsed onto a handful of identities, "
+                        f"so the room_name selector is almost certainly reading a "
+                        f"label several cards share — an amenity chip or a bed "
+                        f"type — rather than the room's own name.",
+                        context={
+                            "names_seen": summary.collapsed_names[:8],
+                            "hotel_source_id": payload["hotel_source_id"],
+                            "stay": str(stay),
+                            "selectors": (payload.get("adapter_config") or {}).get("selectors"),
+                        },
+                    ),
+                    hotel_id=payload["hotel_id"],
+                    source_id=payload["source_id"],
+                    target_id=target_ids[0],
+                    check_run_id=check_run_id,
+                    now=now,
+                )
+
+        monitoring.record_success(session, target_ids, now)
+        _update_check_run(
+            session,
+            check_run_id,
+            status=CheckRunStatus.SUCCESS,
+            finished_at=now,
+            duration_ms=int((now - started).total_seconds() * 1000),
+            # A run the retry reused (a manual Check now) may carry an earlier
+            # attempt's "looking again" note; it succeeded, so it has none.
+            error_summary=None,
+            offers_found=offers_found,
+            offers_unmatched=offers_unmatched,
+            changes_detected=len(change_ids),
+            # A run that read the page and found the hotel full is a success
+            # with something to say. Both fields are about the window that was
+            # ASKED for -- check_in/check_out on this row -- whatever the roll
+            # went on to read.
+            sold_out=not _has_rooms(readings[0][1]),
+            notes=_sold_out_note(readings),
+        )
+        change_ids = list(change_ids)
+
+        # TONIGHT'S READING OF A HOTEL SOMEBODY PRICES AGAINST. Checked here,
+        # while the session is open, and acted on after the commit below.
+        from app.workers.tasks_repricing import watched_as_benchmark
+
+        benchmark_night = (
+            requested_stay.check_out == requested_stay.check_in + timedelta(days=1)
+            and requested_stay.check_in == local_today(get_settings().timezone)
+            and watched_as_benchmark(session, payload["hotel_id"])
+        )
+
+        # TONIGHT'S READING OF OUR OWN HOTEL: Sales Daddy's AI quotes it.
+        # Every reading, not only a confirmed change -- the AI must quote what
+        # the platform shows now, and the task skips a list already sent.
+        from app.workers.tasks_price_feed import enabled as price_feed_enabled
+
+        own_tonight = (
+            price_feed_enabled()
+            and requested_stay.check_out == requested_stay.check_in + timedelta(days=1)
+            and requested_stay.check_in == local_today(get_settings().timezone)
+            and bool(session.scalar(
+                select(Hotel.is_own_property).where(Hotel.id == payload["hotel_id"])
+            ))
+        )
+
+    logger.info(
+        "fetch_complete",
+        offers=offers_found,
+        unmatched=offers_unmatched,
+        changes=len(change_ids),
+        windows=len(readings),
+    )
+
+    # Enqueued after the transaction, for the same reason the notify hand-off
+    # is: the repair reads this source's row, and must never race the write
+    # that told it to run.
+    # NOT on collapsed_names alone. Every duplicate used to ask for a
+    # re-derivation, so a hotel selling one room under two rate plans spent a
+    # browser-driven rediscovery on every check, forever, against a page whose
+    # two cards are identical in every rendered character except the price --
+    # there is no config discovery could return that would separate them. The
+    # repair only runs where a config change could actually help.
+    if collapsed_names and selector_suspect:
+        _request_repair(
+            payload, requested_stay, reason="offers_collapsed", logger=logger,
+            # The labels that collapsed. The repair needs them to tell the rooms
+            # the broken config invented from the hotel's real ones.
+            collapsed_names=collapsed_names,
+        )
+
+    if change_ids:
+        # Enqueued only after the transaction has committed, so the notify
+        # worker can never read a change row that does not exist yet.
+        from app.workers.tasks_notify import dispatch_changes
+
+        dispatch_changes.apply_async(
+            args=[change_ids], queue="notify",
+            countdown=get_settings().digest_window_seconds,
+        )
+
+    if benchmark_night:
+        # Every reading, not only a confirmed change: whether the figure the
+        # rule uses moved is the task's question, and it answers it cheaply.
+        from app.workers.tasks_repricing import benchmark_moved
+
+        benchmark_moved.apply_async(
+            args=[payload["hotel_id"], requested_stay.check_in.isoformat()], queue="http",
+        )
+
+    if own_tonight:
+        from app.workers.tasks_price_feed import push_prices
+
+        push_prices.apply_async(args=[payload["hotel_id"]], queue="notify")
+
+    return {
+        "status": "success",
+        "check_run_id": check_run_id,
+        "offers": offers_found,
+        "changes": len(change_ids),
+    }
+
+
+def _request_repair(
+    payload: dict[str, Any],
+    stay: StayWindow,
+    *,
+    reason: str,
+    logger,
+    collapsed_names: list[str] | None = None,
+) -> None:
+    """Ask discovery to re-derive this source's config.
+
+    Advisory, not obligatory: the task decides for itself whether it is allowed
+    to run (see app/services/rediscovery.py). Everything here is wrapped
+    because a broker that is momentarily unreachable must not turn a successful
+    fetch into a failed one — the price data is already committed, and the
+    alert on Attention stands whether or not this hand-off lands.
+    """
+    if not get_settings().auto_rediscovery_enabled:
+        return
+    try:
+        from app.workers.tasks_repair import rediscover_source
+
+        rediscover_source.apply_async(
+            args=[payload["hotel_source_id"]],
+            kwargs={
+                # The same stay window the fetch used, so discovery inspects
+                # the page the fetch actually read rather than a default one
+                # that might legitimately show different rooms.
+                "check_in": stay.check_in.isoformat(),
+                "check_out": stay.check_out.isoformat(),
+                "adults": payload["adults"],
+                "children": payload["children"],
+                "reason": reason,
+                "collapsed_names": list(collapsed_names or []),
+            },
+            queue="browser",
+            # Discovery reads the page for the window frozen into these kwargs,
+            # so a repair that waits out its own stay window would re-derive
+            # selectors from a page showing no rooms and "fix" the config into
+            # something worse than it found. Given the same deadline as the
+            # fetch that asked for it.
+            expires=datetime.now(UTC) + timedelta(seconds=_STALE_AFTER_SECONDS),
+        )
+        logger.info("repair_requested", reason=reason)
+    except Exception as exc:  # noqa: BLE001 - never fails the fetch
+        logger.warning("repair_request_failed", error=str(exc)[:200])
+
+
+def _handle_failure(
+    task,
+    error: FetchError,
+    payload: dict[str, Any],
+    stay: StayWindow,
+    target_ids: list[int],
+    check_run_id: str,
+    started: datetime,
+    triggered_by: str,
+    logger,
+) -> dict[str, Any]:
+    """Classify, record, and decide whether this is worth trying again.
+
+    Everything is recorded before the retry decision, so an error that is
+    ultimately retried successfully still leaves a trail — that trail is how a
+    site that is slowly degrading gets noticed before it fails outright.
+    """
+    now = datetime.now(UTC)
+    attempt = task.request.retries
+
+    # SCHEMA DRIFT IS BELIEVED ONLY WHEN IT REPRODUCES.
+    #
+    # "No room matched" is also what a page looks like when it was read before
+    # its rooms arrived. On 24 Sep a Treebo page was captured with "Available
+    # Rooms for Your Stay" still showing its spinner, and Our Resort's Booking.com
+    # page came back with no text at all -- both filed as a redesign, both
+    # read perfectly by the very next check. Eleven such rows sat on
+    # Attention in an afternoon, each one a red alert and a repair attempt
+    # spent on a site that had not changed.
+    #
+    # Nothing on those pages says "still loading" in a way every site shares
+    # (Treebo's spinner is an unlabelled styled div), so this does not try to
+    # read one. It looks again: a fresh page load a minute later. A real
+    # redesign fails the second look too and is reported exactly as before,
+    # one minute later; a slow page does not, and leaves no trace but a log
+    # line and a failed check run.
+    #
+    # FIRST SIGHTING MEANS THE PAYLOAD'S FLAG, NOT ``retries == 0``. A fetch
+    # the politeness budget deferred, or one that timed out once, arrives here
+    # with retries already counted, and a slow page on that attempt was
+    # reported with no second look at all.
+    #
+    # ONLY WHEN THE SECOND LOOK CAN HAPPEN. A retry keeps the message's
+    # deadline, and one scheduled past it is dropped by the worker unrun --
+    # leaving a real redesign reported nowhere. Too close to the deadline,
+    # this sighting is reported as it always was.
+    countdown = _DRIFT_CONFIRM_SECONDS + random.uniform(0, 30)
+    left = _seconds_until_expiry(task)
+    if (error.error_class == ErrorClass.PARSE_SCHEMA_DRIFT
+            and not payload.get("drift_seen")
+            and (left is None or left > countdown + _DRIFT_CONFIRM_SECONDS)):
+        note = f"[unconfirmed {error.error_class}, looking again] {str(error)[:760]}"
+        with sync_session() as session:
+            if (task.request.kwargs or {}).get("check_run_id"):
+                # The retry reuses this row (a manual Check now, which the
+                # page is polling): it is still going, not failed.
+                _update_check_run(session, check_run_id, error_summary=note)
+            else:
+                _update_check_run(
+                    session, check_run_id,
+                    status=CheckRunStatus.FAILED, finished_at=now,
+                    duration_ms=int((now - started).total_seconds() * 1000),
+                    error_summary=note,
+                )
+        logger.warning("schema_drift_unconfirmed_retrying", message=str(error)[:300])
+        raise task.retry(
+            args=[{**payload, "drift_seen": True}, *list(task.request.args or [])[1:]],
+            kwargs=task.request.kwargs, exc=error, countdown=countdown,
+        )
+
+    if error.error_class == ErrorClass.RATE_LIMITED:
+        penalise_source(payload["source_id"])
+
+    with sync_session() as session:
+        monitoring.record_error(
+            session,
+            error=error,
+            hotel_id=payload["hotel_id"],
+            source_id=payload["source_id"],
+            target_id=target_ids[0] if target_ids else None,
+            check_run_id=check_run_id,
+            now=now,
+        )
+
+        will_retry = error.is_transient and attempt < error.max_retries
+        if not will_retry:
+            monitoring.record_failure(session, target_ids, error, now)
+
+        _update_check_run(
+            session,
+            check_run_id,
+            status=CheckRunStatus.FAILED,
+            finished_at=now,
+            duration_ms=int((now - started).total_seconds() * 1000),
+            error_summary=f"[{error.error_class}] {str(error)[:800]}",
+        )
+
+    logger.warning(
+        "fetch_failed",
+        error_class=str(error.error_class),
+        transient=error.is_transient,
+        attempt=attempt,
+        message=str(error)[:300],
+    )
+
+    if error.is_transient and attempt < error.max_retries:
+        raise task.retry(exc=error, countdown=_retry_delay(error, attempt))
+
+    # The other ways a redesign shows up. Where a collapsed room list means the
+    # selectors still match something wrong, these mean they match nothing at
+    # all -- the adapter refused to guess and said so.
+    #
+    #   schema drift    the configured selectors found no rooms on a page that
+    #                   loaded fine
+    #   adapter config  the config cannot describe this page at all: a strategy
+    #                   with no selectors to run, or an endpoint that has
+    #                   stopped answering and no DOM fallback behind it
+    #
+    # Both are cases where discovery has a live page in front of it and can
+    # derive a working config, which is exactly the job it does. Only these
+    # two: a timeout or a block means the page was never read, so re-running
+    # discovery against it would just add load to a site already refusing us.
+    #
+    # ``tasks_repair.REPAIRABLE`` has always listed both, and resolves both on a
+    # successful repair -- but nothing ever dispatched the second one, so that
+    # half was unreachable. A hotel whose endpoint went away sat on Attention
+    # telling an operator to run probe_site.py by hand, while the machinery to
+    # fix it without anyone's help was already installed and idle.
+    if error.error_class in (ErrorClass.PARSE_SCHEMA_DRIFT, ErrorClass.ADAPTER_CONFIG):
+        _request_repair(
+            payload,
+            stay,
+            reason=("schema_drift"
+                    if error.error_class == ErrorClass.PARSE_SCHEMA_DRIFT
+                    else "adapter_config"),
+            logger=logger,
+        )
+
+    # Permanent, or out of retries. Return normally: this hotel is done for
+    # this cycle, and nothing else should be affected by it.
+    return {"status": "failed", "check_run_id": check_run_id,
+            "error_class": str(error.error_class)}
+
+
+def _seconds_until_expiry(task) -> float | None:
+    """How long this message has before the worker would drop it, or None."""
+    expires = getattr(task.request, "expires", None)
+    if not expires:
+        return None
+    if isinstance(expires, str):
+        try:
+            expires = datetime.fromisoformat(expires)
+        except ValueError:
+            return None
+    if not isinstance(expires, datetime):
+        return None
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return (expires - datetime.now(UTC)).total_seconds()
+
+
+def _retry_delay(error: FetchError, attempt: int) -> float:
+    """Exponential backoff with jitter, honouring ``Retry-After`` when given.
+
+    The jitter is not cosmetic: without it, thirty hotels failing on the same
+    network blip retry in the same second and recreate the blip.
+    """
+    if error.error_class == ErrorClass.RATE_LIMITED:
+        wait = getattr(error, "retry_after_seconds", None)
+        if wait:
+            return float(wait) + random.uniform(0, 30)
+    base = _BACKOFF[min(attempt, len(_BACKOFF) - 1)]
+    return base + random.uniform(0, base * 0.25)
+
+
+# -- manual entry ----------------------------------------------------
+@shared_task(name="fetch.record_manual_offers", ignore_result=True)
+def record_manual_offers(
+    payload: dict[str, Any], check_run_id: str, triggered_by: str = "manual"
+) -> dict[str, Any]:
+    """Ingest prices an operator typed into the dashboard.
+
+    Runs through the identical pipeline as a scraped fetch — same offer key,
+    same comparison, same debounce, same notifications. A hotel that has to be
+    tracked by hand therefore produces history indistinguishable from an
+    automated one, which is what makes manual entry a real fallback rather
+    than a spreadsheet bolted onto the side.
+
+    The room type is supplied by the operator, so the room-matching step is
+    skipped: a human choosing from a list is already the highest-confidence
+    mapping this system recognises.
+    """
+    from app.db.models import Hotel, HotelSource, RoomType
+
+    now = datetime.now(UTC)
+    offers = payload["offers"]
+    changes: list[int] = []
+
+    with sync_session() as session:
+        hotel_source = session.get(HotelSource, payload["hotel_source_id"])
+        if hotel_source is None:
+            log.warning("manual_entry_unknown_hotel_source", payload_keys=sorted(payload))
+            return {"status": "failed", "reason": "unknown hotel_source"}
+
+        hotel = session.get(Hotel, hotel_source.hotel_id)
+        thresholds = monitoring.default_thresholds()
+        offers_written = 0
+
+        for entry in offers:
+            room = session.get(RoomType, entry["room_type_id"])
+            if room is None or room.hotel_id != hotel_source.hotel_id:
+                log.warning(
+                    "manual_entry_bad_room",
+                    room_type_id=entry["room_type_id"],
+                    hotel_id=hotel_source.hotel_id,
+                )
+                continue
+
+            stay = StayWindow(
+                check_in=datetime.fromisoformat(entry["check_in"]).date(),
+                check_out=datetime.fromisoformat(entry["check_out"]).date(),
+            )
+            offer = NormalizedOffer(
+                raw_room_name=room.name,
+                price_inclusive=_decimal(entry.get("price_inclusive")),
+                price_exclusive=_decimal(entry.get("price_exclusive")),
+                taxes_fees=_decimal(entry.get("taxes_fees")),
+                currency=entry.get("currency") or hotel_source.currency,
+                meal_plan=entry.get("meal_plan"),
+                refundable=entry.get("refundable"),
+                is_available=entry.get("is_available", True),
+                raw_payload={"source": "manual_entry", "entered_by": triggered_by},
+            )
+
+            ctx = IngestContext(
+                hotel_id=hotel_source.hotel_id,
+                source_id=hotel_source.source_id,
+                hotel_source_id=hotel_source.id,
+                stay=stay,
+                adults=entry.get("adults", 2),
+                children=entry.get("children", 0),
+                currency=offer.currency,
+                price_basis=PriceBasis(get_settings().price_basis),
+                thresholds=thresholds,
+                checked_at=now,
+                check_run_id=check_run_id,
+            )
+            # One offer at a time: each carries its own stay window, and the
+            # disappearance sweep is scoped to one window. Batching windows
+            # together would mark rooms of OTHER dates as no longer listed.
+            summary = ingest_fetch_result(
+                session,
+                FetchResult(offers=[offer], sold_out_detected=not offer.is_available),
+                ctx,
+            )
+            changes.extend(summary.change_ids)
+            offers_written += 1
+
+        _update_check_run(
+            session,
+            check_run_id,
+            status=CheckRunStatus.SUCCESS,
+            finished_at=now,
+            offers_found=offers_written,
+            changes_detected=len(changes),
+        )
+
+    if changes:
+        from app.workers.tasks_notify import dispatch_changes
+
+        dispatch_changes.apply_async(args=[changes], queue="notify")
+
+    log.info(
+        "manual_entry_recorded",
+        hotel=hotel.name if hotel else None,
+        offers=offers_written,
+        changes=len(changes),
+    )
+    return {"status": "success", "offers": offers_written, "changes": len(changes)}
+
+
+def _decimal(value):
+    from decimal import Decimal
+
+    return None if value is None else Decimal(str(value))
+
+
+# -- check_run bookkeeping -------------------------------------------
+def _write_check_run(
+    check_run_id: str,
+    payload: dict[str, Any],
+    stay: StayWindow,
+    started: datetime,
+    status: CheckRunStatus,
+    *,
+    triggered_by: str,
+    error_summary: str | None = None,
+) -> None:
+    """Insert (or leave alone) the row the dashboard polls.
+
+    The API creates this row before returning 202 for a manual run, so this has
+    to tolerate it already existing.
+    """
+    with sync_session() as session:
+        existing = session.get(CheckRun, check_run_id)
+        if existing is not None:
+            existing.status = status
+            if error_summary:
+                existing.error_summary = error_summary
+            return
+
+        session.add(
+            CheckRun(
+                id=check_run_id,
+                monitor_target_id=payload["target_ids"][0] if payload["target_ids"] else None,
+                triggered_by=triggered_by,
+                started_at=started,
+                status=status,
+                check_in=stay.check_in,
+                check_out=stay.check_out,
+                error_summary=error_summary,
+            )
+        )
+
+
+def _update_check_run(session, check_run_id: str, **fields: Any) -> None:
+    run = session.get(CheckRun, check_run_id)
+    if run is None:
+        return
+    for key, value in fields.items():
+        setattr(run, key, value)
+
+
+def _lock_name(payload: dict[str, Any], stay: StayWindow | None = None) -> str:
+    """The in-flight lock for one hotel source and one stay window.
+
+    ``stay`` overrides the window in the payload, which the rollover needs: the
+    night it goes on to read is NOT the night the payload describes, and taking
+    the payload's lock for it would leave that night unguarded. Must keep
+    producing exactly what ``DueGroup.lock_key`` does -- the dispatcher and the
+    task have to agree on the name or the lock protects nothing.
+    """
+    check_in = stay.check_in.isoformat() if stay else payload["check_in"]
+    check_out = stay.check_out.isoformat() if stay else payload["check_out"]
+    return (
+        f"fetch:{payload['hotel_source_id']}:{check_in}"
+        f":{check_out}:{payload['adults']}:{payload['children']}"
+    )

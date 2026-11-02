@@ -1,0 +1,188 @@
+{
+ "roomGridData": {
+  "masterRooms": [
+   {
+    "name": "Superior",
+    "rooms": [
+     {
+      "name": "Superior",
+      "quantity": 1,
+      "isFit": true,
+      "maxOccupancy": 2,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 7650.0
+      },
+      "perNightPrice": {
+       "display": 7650.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 9027.0
+      },
+      "totalPrice": {
+       "display": 9027.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 2 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Villa with Garden View",
+    "rooms": [
+     {
+      "name": "Villa with Garden View",
+      "quantity": 1,
+      "isFit": true,
+      "maxOccupancy": 2,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 9900.0
+      },
+      "perNightPrice": {
+       "display": 9900.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 11682.0
+      },
+      "totalPrice": {
+       "display": 11682.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 2 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Family Room",
+    "rooms": [
+     {
+      "name": "Family Room",
+      "quantity": 1,
+      "isFit": true,
+      "maxOccupancy": 4,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 13500.0
+      },
+      "perNightPrice": {
+       "display": 13500.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 15930.0
+      },
+      "totalPrice": {
+       "display": 15930.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 2 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     },
+     {
+      "name": "Family Room",
+      "quantity": 1,
+      "isFit": false,
+      "maxOccupancy": 4,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 14400.0
+      },
+      "perNightPrice": {
+       "display": 14400.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 16992.0
+      },
+      "totalPrice": {
+       "display": 16992.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 4 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     }
+    ]
+   },
+   {
+    "name": "Suite",
+    "rooms": [
+     {
+      "name": "Suite",
+      "quantity": 1,
+      "isFit": true,
+      "maxOccupancy": 4,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 15750.0
+      },
+      "perNightPrice": {
+       "display": 15750.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 18585.0
+      },
+      "totalPrice": {
+       "display": 18585.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 2 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     },
+     {
+      "name": "Suite",
+      "quantity": 1,
+      "isFit": false,
+      "maxOccupancy": 4,
+      "isBreakfastIncluded": true,
+      "supplierId": 332,
+      "ratePlanId": 19401175,
+      "pricePopupViewModel": {
+       "agodaPrice": 16650.0
+      },
+      "perNightPrice": {
+       "display": 16650.0
+      },
+      "inclusivePriceWithoutExtraBed": {
+       "display": 19647.0
+      },
+      "totalPrice": {
+       "display": 19647.0
+      },
+      "roomChildAndExtraBedPolicyViewModel": {
+       "capacityText": "Max 4 adults"
+      },
+      "taxesAndSurchargesList": [
+       "Tax 18%"
+      ]
+     }
+    ]
+   }
+  ]
+ }
+}

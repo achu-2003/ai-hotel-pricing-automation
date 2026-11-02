@@ -1,0 +1,2046 @@
+/*
+ * Dashboard behaviour. No framework and no build step.
+ *
+ * Everything mutating posts to /api/v1/..., never to a parallel set of
+ * dashboard handlers, so validation, authorisation and the audit trail cannot
+ * drift between the two entry points. The session cookie authenticates these
+ * calls; it is HttpOnly, so this file never sees or handles the token.
+ *
+ * Served from /static because the Content-Security-Policy allows scripts only
+ * from 'self' — no CDN, no inline handlers.
+ */
+(function () {
+  "use strict";
+
+  /** POST/PATCH JSON, returning {ok, status, body}. */
+  async function api(path, method, body) {
+    const response = await fetch(path, {
+      method: method || "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let payload = null;
+    try {
+      payload = await response.json();
+    } catch (e) {
+      payload = null;
+    }
+    return { ok: response.ok, status: response.status, body: payload };
+  }
+
+  /** RFC 7807 problem documents carry the useful text in `detail`. */
+  function problemText(result) {
+    if (!result.body) return "Request failed (" + result.status + ")";
+    if (result.body.errors && result.body.errors.length) {
+      return result.body.errors
+        .map(function (e) { return e.field + ": " + e.message; })
+        .join("; ");
+    }
+    return result.body.detail || result.body.title || "Request failed";
+  }
+
+  // -- login ---------------------------------------------------------
+  const loginForm = document.getElementById("login-form");
+  if (loginForm) {
+    loginForm.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const error = document.getElementById("login-error");
+      error.hidden = true;
+
+      const result = await api("/api/v1/auth/login", "POST", {
+        username: loginForm.username.value,
+        password: loginForm.password.value,
+      });
+
+      if (result.ok) {
+        // The cookie is set by the response; a full navigation follows so the
+        // server renders the target page with the session already in place.
+        window.location.href = loginForm.dataset.next || "/";
+        return;
+      }
+      error.textContent = problemText(result);
+      error.hidden = false;
+    });
+  }
+
+  // -- generic API-backed forms --------------------------------------
+  // Any <form class="api-form" data-endpoint data-method>. Checkboxes become
+  // booleans, empty strings become omitted fields (so an untouched optional
+  // input is not sent as "").
+  document.querySelectorAll("form.api-form").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      // A form that destroys something says so first. Native confirm rather
+      // than a modal: it cannot be dismissed by a stray click and needs no
+      // markup on every page that uses it.
+      if (form.dataset.confirm && !window.confirm(form.dataset.confirm)) return;
+      const status = form.querySelector(".form-status");
+      const payload = {};
+
+      // An unchecked box is simply absent from FormData, so a PATCH assembled
+      // from FormData alone can switch a flag ON and never OFF again — the
+      // server sees no key and leaves the old value. Collected explicitly and
+      // first, so the loop below overwrites the checked ones with true.
+      form.querySelectorAll('input[type="checkbox"][name]').forEach(function (box) {
+        payload[box.name] = box.checked;
+      });
+
+      let jsonError = null;
+      new FormData(form).forEach(function (value, key) {
+        if (value === "") return;
+        // Fields marked data-json hold JSON (adapter_config), and must be sent
+        // as an object. Parsed here so a typo is caught before the request,
+        // with a message pointing at the field rather than a 422 from Pydantic.
+        const field = form.querySelector('[name="' + key + '"][data-json]');
+        if (field) {
+          try {
+            payload[key] = JSON.parse(value);
+          } catch (e) {
+            jsonError = key + " is not valid JSON: " + e.message;
+          }
+          return;
+        }
+        // Fields marked data-text are sent as typed. A client number or a
+        // password of digits is not a number: Number("00123") is 123, and a
+        // login that fails because its leading zeros were dropped on the way
+        // to the server fails with nothing on screen to say why.
+        if (form.querySelector('[name="' + key + '"][data-text]')) {
+          payload[key] = value;
+          return;
+        }
+        if (/^-?\d+$/.test(value)) { payload[key] = Number(value); return; }
+        payload[key] = value === "true" ? true : value;
+      });
+
+      const status0 = form.querySelector(".form-status");
+      if (jsonError) {
+        if (status0) {
+          status0.hidden = false;
+          status0.textContent = jsonError;
+          status0.className = "form-status error";
+        }
+        return;
+      }
+
+      // Some submits open a browser server-side and take the better part of a
+      // minute. Silence for that long reads as a hang, so the button says what
+      // is happening and stops a second click landing on top of the first.
+      const submit = form.querySelector('button[type="submit"]');
+      const original = submit ? submit.textContent : null;
+      if (submit) {
+        submit.disabled = true;
+        submit.textContent = form.dataset.busy || "Working…";
+      }
+      if (status && form.dataset.busyNote) {
+        status.hidden = false;
+        status.textContent = form.dataset.busyNote;
+        status.className = "form-status";
+      }
+
+      const result = await api(form.dataset.endpoint, form.dataset.method || "POST", payload);
+
+      if (submit) {
+        submit.disabled = false;
+        submit.textContent = original;
+      }
+      if (status) {
+        status.hidden = false;
+        status.textContent = result.ok ? "Saved." : problemText(result);
+        status.className = "form-status " + (result.ok ? "ok" : "error");
+      }
+      // data-redirect sends the browser somewhere specific after success —
+      // the change-password form must leave its own page, not reload it.
+      if (result.ok) {
+        setTimeout(function () {
+          if (form.dataset.redirect) {
+            window.location.href = form.dataset.redirect;
+          } else {
+            window.location.reload();
+          }
+        }, 600);
+      }
+    });
+  });
+
+  // -- rate application: test the saved login ------------------------
+  // Not a form.api-form: that handler says "Saved." and reloads, and the
+  // useful part of this answer is the sentence the probe came back with --
+  // "logged in, landed on X" or "refused: the page says Y" -- shown in
+  // place, verdict and all, and replaced by the next attempt.
+  //
+  // A POLL, NOT ONE REQUEST. The browser on the worker may stop at a
+  // one-time-code screen and wait for the owner; the page asks every two
+  // seconds where the test is, shows the code box when it is wanted, and
+  // sends the code back through the same status channel.
+  document.querySelectorAll("form.test-login-form").forEach(function (form) {
+    const button = form.querySelector('button[type="submit"]');
+    const status = form.querySelector(".form-status");
+    const box = form.querySelector(".test-result");
+    const ask = form.querySelector(".code-ask");
+    const codeInput = ask.querySelector("input[name=code]");
+    const sendCode = ask.querySelector(".send-code");
+    const endpoint = form.dataset.endpoint;
+    let polling = null;
+
+    function note(text, cls) {
+      status.hidden = !text;
+      status.className = "form-status " + (cls || "");
+      status.textContent = text || "";
+    }
+
+    function showVerdict(r) {
+      box.hidden = false;
+      box.className = "test-result " + (r.ok ? "ok" : "error");
+      box.querySelector(".test-verdict").textContent = r.ok ? "Logged in" : "Not logged in";
+      box.querySelector(".test-when").textContent = " \u00b7 tested just now";
+      box.querySelector(".test-message").textContent = r.message || "";
+      const shot = box.querySelector(".test-shot");
+      shot.hidden = !r.has_screenshot;
+      // Same URL, new picture: a cache-buster so the link opens this
+      // attempt's screenshot rather than the browser's copy of the last one.
+      if (r.has_screenshot) shot.href = "/api/v1/rate-application/screenshot?t=" + Date.now();
+    }
+
+    function finish() {
+      if (polling) { clearInterval(polling); polling = null; }
+      button.disabled = false;
+      button.textContent = "Test login";
+      ask.hidden = true;
+      sendCode.disabled = false;
+      codeInput.value = "";
+    }
+
+    function apply(state) {
+      if (state.status === "running") {
+        ask.hidden = true;
+        note(state.message || "Signing in\u2026");
+      } else if (state.status === "needs_code") {
+        note("");
+        ask.hidden = false;
+        ask.querySelector(".code-prompt").textContent =
+          "The application asked for a one-time code: \u201c" + (state.message || "") + "\u201d";
+        if (document.activeElement !== codeInput && !codeInput.value) codeInput.focus();
+      } else if (state.status === "done") {
+        note("");
+        showVerdict(state);
+        finish();
+      } else {
+        note("The test stopped without an answer. Try again.", "error");
+        finish();
+      }
+    }
+
+    async function poll() {
+      const result = await api(endpoint + "/status", "GET");
+      if (!result.ok) { note(problemText(result), "error"); finish(); return; }
+      apply(result.body);
+    }
+
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      button.disabled = true;
+      button.textContent = "Signing in\u2026";
+      box.hidden = true;
+      note("Opening the login page in a browser and signing in. This can take up to a minute.");
+      const result = await api(endpoint, "POST", {});
+      if (!result.ok) { note(problemText(result), "error"); finish(); return; }
+      apply(result.body);
+      if (!polling) polling = setInterval(poll, 2000);
+    });
+
+    async function submitCode() {
+      const code = codeInput.value.trim();
+      if (!code) { codeInput.focus(); return; }
+      sendCode.disabled = true;
+      const result = await api(endpoint + "/code", "POST", { code: code });
+      if (!result.ok) { note(problemText(result), "error"); sendCode.disabled = false; return; }
+      apply(result.body);
+    }
+    sendCode.addEventListener("click", submitCode);
+    codeInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") { event.preventDefault(); submitCode(); }
+    });
+
+    // A test left waiting when the page was refreshed is still waiting on
+    // the worker; pick it up rather than offering to start a second one.
+    api(endpoint + "/status", "GET").then(function (result) {
+      if (result.ok && result.body && (result.body.status === "running" || result.body.status === "needs_code")) {
+        button.disabled = true;
+        button.textContent = "Signing in\u2026";
+        apply(result.body);
+        polling = setInterval(poll, 2000);
+      }
+    });
+  });
+
+  // -- repricing: preview or apply tonight's proposals in RMS ---------
+  //
+  // Two buttons on one form, differing only in the mode they send. Like
+  // the login test, the job runs on the worker with a browser open and the
+  // page polls; unlike it, there is no code box -- a one-time code is
+  // answered on the Rate app page, and a run that meets one says so.
+  // -- the automatic switch, beside Preview and Apply -------------------
+  //
+  // Saves itself the moment it is pressed, to its own endpoint, and renders
+  // from what comes BACK rather than from what was clicked. A toggle that
+  // flips optimistically and then fails leaves the page promising that rates
+  // are moving by themselves when they are not, which is the one lie this
+  // control must never tell.
+  //
+  // Turning it ON asks first. Turning it off never does: stopping something
+  // is not a decision anyone needs protecting from.
+  document.querySelectorAll("button.auto-toggle").forEach(function (toggle) {
+    const label = toggle.querySelector(".auto-label small");
+
+    function render(on) {
+      toggle.classList.toggle("on", on);
+      toggle.setAttribute("aria-checked", on ? "true" : "false");
+      if (label) label.textContent = on ? "on — every 30 minutes" : "off — nothing moves by itself";
+    }
+
+    toggle.addEventListener("click", async function () {
+      if (toggle.disabled || toggle.classList.contains("busy")) return;
+      const wanted = !toggle.classList.contains("on");
+      if (wanted && toggle.dataset.confirmOn && !window.confirm(toggle.dataset.confirmOn)) return;
+
+      toggle.classList.add("busy");
+      const result = await api(toggle.dataset.endpoint, "PUT", { enabled: wanted });
+      toggle.classList.remove("busy");
+
+      if (!result.ok) {
+        // Left exactly as it was, and said out loud. A silent no-op reads
+        // as a dead button and gets clicked again.
+        render(toggle.classList.contains("on"));
+        window.alert("Could not change the automatic switch. " + problemText(result));
+        return;
+      }
+      render(Boolean(result.body && result.body.auto_enabled));
+    });
+  });
+
+  document.querySelectorAll("form.repricing-run-form").forEach(function (form) {
+    const buttons = Array.from(form.querySelectorAll("button.run"));
+    // The per-room buttons live in the table, outside this form, but they
+    // start the same job and must be disabled by the same busy() -- two
+    // runs at once is one browser fighting itself over the same grid.
+    const roomButtons = Array.from(document.querySelectorAll("button.apply-room"));
+    const laneRoomButtons = Array.from(document.querySelectorAll("button.apply-lane-room"));
+    const status = form.querySelector(".form-status");
+    const endpoint = form.dataset.endpoint;
+    const roundTo = Number(form.dataset.roundTo) || 1;
+    let polling = null;
+
+    // -- the proposed price is editable ---------------------------------
+    //
+    // The box holds a guest price, as the rule's did. As it changes, the
+    // row shows the RMS rate it becomes -- the same ratio the worker uses,
+    // RMS-now over site-now -- and whether the room's RMS floor or ceiling
+    // would hold it. Only boxes that differ from the rule are sent.
+    const inr = new Intl.NumberFormat("en-IN", { maximumFractionDigits: 0 });
+    const rupees = function (n) { return "₹" + inr.format(n); };
+    const pctText = function (price, our) {
+      const pct = (price - our) / our * 100;
+      return (pct >= 0 ? "+" : "") + pct.toFixed(1) + "%";
+    };
+    const priceBoxes = Array.from(document.querySelectorAll("input.proposed-price"));
+
+    function edited(box) {
+      const typed = box.value.trim();
+      return typed !== "" && Number(typed) > 0 && Number(typed) !== Number(box.dataset.rule || NaN);
+    }
+    // The same sum as repricing.to_rms(), including which way it rounds, so
+    // the row shows the rate Apply will actually write. A guest price that is
+    // an instruction -- one the owner typed, or a benchmark follow a fixed sum
+    // under another hotel -- takes the whole rupee below the ratio's answer
+    // instead of the tidy multiple of round_to, because ten rupees of
+    // tidiness in RMS is six on the line the guest reads and the gap was set
+    // in rupees. Everything else keeps the rounding.
+    //
+    // With tax in, the ratio is taken BEFORE GST, which is 5% up to a 7,500
+    // tariff and 18% above it -- the same as repricing.before_gst() and
+    // guest_sees(). Scaling with-tax prices across the slab wrote a rate
+    // a thousand rupees over the hotel being followed.
+    const GST_LIMIT = 7500, GST_LOW = 0.05, GST_HIGH = 0.18;
+    function beforeGst(guest) {
+      if (guest <= GST_LIMIT * (1 + GST_LOW)) return guest / (1 + GST_LOW);
+      return Math.max(guest / (1 + GST_HIGH), GST_LIMIT);
+    }
+    function toRms(box, price, cur, our) {
+      const withTax = box.dataset.withTax === "1";
+      const target = withTax ? beforeGst(price) : price;
+      const ours = withTax ? beforeGst(our) : our;
+      const raw = target * cur / ours;
+      const exact = box.dataset.exact === "1" || edited(box);
+      let rate = exact ? Math.floor(raw) : Math.round(raw / roundTo) * roundTo;
+      if (withTax && target <= GST_LIMIT) {
+        const most = Math.floor(GST_LIMIT * cur / ours);
+        if (rate > most) rate = exact || roundTo <= 1 ? most : Math.floor(most / roundTo) * roundTo;
+      }
+      return rate;
+    }
+    function guestSees(box, amount, cur, our) {
+      if (box.dataset.withTax !== "1") return amount * our / cur;
+      const preTax = amount * beforeGst(our) / cur;
+      return preTax * (1 + (preTax <= GST_LIMIT ? GST_LOW : GST_HIGH));
+    }
+    function refresh(box) {
+      const row = box.closest("tr");
+      const statusCell = row.querySelector("td.status");
+      if (statusCell.dataset.original === undefined) statusCell.dataset.original = statusCell.innerHTML;
+      const price = Number(box.value);
+      const our = Number(box.dataset.our);
+      const valid = box.value.trim() !== "" && price > 0;
+
+      row.querySelector(".change").textContent = valid && our ? pctText(price, our) : "";
+      row.querySelector(".by-hand").hidden = !edited(box);
+
+      let outside = null;
+      const rmsNew = row.querySelector(".rms-new");
+      if (rmsNew && box.dataset.cur && valid && our) {
+        const amount = toRms(box, price, Number(box.dataset.cur), our);
+        rmsNew.textContent = rupees(amount);
+        if (box.dataset.floor && amount < Number(box.dataset.floor)) {
+          outside = "below this room's RMS floor of " + inr.format(Number(box.dataset.floor));
+        } else if (box.dataset.ceiling && amount > Number(box.dataset.ceiling)) {
+          outside = "above this room's RMS ceiling of " + inr.format(Number(box.dataset.ceiling));
+        }
+      } else if (rmsNew) {
+        rmsNew.textContent = "—";
+      }
+
+      // WHAT THE GUEST ENDS UP SEEING. The typed number is a guest price and
+      // the RMS rate is derived from it, so the two agree only as far as the
+      // conversion's rounding allows -- which is why an instruction converts
+      // to the rupee (see toRms) and lands on the number asked for, give or
+      // take one rupee under it. Showing the trip back is what makes that
+      // checkable instead of a surprise on the site tomorrow.
+      const siteNew = row.querySelector(".site-new");
+      if (siteNew) {
+        const cur = Number(box.dataset.cur);
+        if (cur && valid && our) {
+          const amount = toRms(box, price, cur, our);
+          siteNew.textContent = rupees(Math.round(guestSees(box, amount, cur, our)));
+        } else {
+          siteNew.textContent = "—";
+        }
+      }
+
+      row.classList.toggle("edited", edited(box));
+      if (!edited(box)) {
+        statusCell.innerHTML = statusCell.dataset.original;
+        return;
+      }
+      statusCell.innerHTML = outside
+        ? '<span class="tag held">held</span> <span class="muted"></span>'
+        : '<span class="tag ok">will apply</span> <span class="muted">your price</span>';
+      if (outside) statusCell.querySelector(".muted").textContent = outside;
+    }
+    // -- which room of theirs each of ours competes with ---------------
+    //
+    // The selects are the interface; the hidden JSON field is what the form
+    // actually posts, because the api-form serialiser sends flat values and
+    // this is a map. Rebuilt from the selects on every change so the two
+    // cannot drift, and an empty choice drops the key rather than posting a
+    // pairing to nothing.
+    const pairField = document.querySelector('input[name="benchmark_room_pairs"]');
+    const pairSelects = Array.from(document.querySelectorAll("select.pair-select"));
+    if (pairField && pairSelects.length) {
+      const syncPairs = function () {
+        const map = {};
+        pairSelects.forEach(function (sel) {
+          if (sel.value) map[sel.dataset.roomTypeId] = sel.value;
+        });
+        pairField.value = JSON.stringify(map);
+      };
+      pairSelects.forEach(function (sel) { sel.addEventListener("change", syncPairs); });
+      syncPairs();
+    }
+
+    // -- the Booking.com tick ------------------------------------------
+    //
+    // Each room's second row is the Booking.com tick: ticked, the room is
+    // written; unticked, it is left as it is. Other websites are changed
+    // from their own sections, never from here.
+    function boxFor(id) {
+      return priceBoxes.find(function (b) { return b.dataset.roomTypeId === String(id); });
+    }
+    // What the ticks say, for one room or all: the rooms whose Booking.com
+    // tick was taken off, and a line each for the confirm dialog.
+    function channelChoices(onlyId) {
+      const skip = [];
+      const lines = [];
+      document.querySelectorAll("tr.channels-row").forEach(function (row) {
+        const id = row.dataset.roomTypeId;
+        if (onlyId && id !== String(onlyId)) return;
+        const box = boxFor(id);
+        const name = box ? box.dataset.room : id;
+        const main = row.querySelector("input.pick-main");
+        if (main && !main.checked) {
+          skip.push(Number(id));
+          lines.push("  " + name + ": " + main.parentElement.querySelector("strong").textContent + " left as it is");
+        }
+      });
+      return { skip: skip, lines: lines };
+    }
+
+    priceBoxes.forEach(function (box) {
+      box.addEventListener("input", function () { refresh(box); });
+    });
+    roomButtons.forEach(function (b) {
+      if (b.disabled) b.dataset.lockedOff = "1";
+    });
+
+    function overrides() {
+      const out = {};
+      priceBoxes.filter(edited).forEach(function (box) {
+        out[box.dataset.roomTypeId] = Math.round(Number(box.value));
+      });
+      return out;
+    }
+    function describe() {
+      return priceBoxes.filter(edited).map(function (box) {
+        const our = Number(box.dataset.our);
+        const price = Number(box.value);
+        return "  " + box.dataset.room + ": " + rupees(price) + (our ? " (" + pctText(price, our) + " on today)" : "");
+      }).join("\n");
+    }
+
+    function note(text, cls) {
+      status.hidden = !text;
+      status.className = "form-status " + (cls || "");
+      status.textContent = text || "";
+    }
+    function busy(on) {
+      buttons.forEach(function (b) { b.disabled = on; });
+      roomButtons.concat(laneRoomButtons).forEach(function (b) {
+        // Never re-enable a button the template disabled for its own reason
+        // (no login saved, no price of ours tonight).
+        if (on) { b.disabled = true; } else if (b.dataset.lockedOff !== "1") { b.disabled = false; }
+      });
+    }
+    function finish(state) {
+      if (polling) { clearInterval(polling); polling = null; }
+      busy(false);
+      if (state && state.status === "done") {
+        note(state.message || "Done.", state.ok ? "ok" : "error");
+        // The log below the fold has new rows; show them.
+        setTimeout(function () { window.location.reload(); }, 2500);
+      }
+    }
+    function apply(state) {
+      if (!state) { finish(null); return; }
+      if (state.status === "running") { note(state.message || "Working…"); return; }
+      finish(state);
+    }
+    async function poll() {
+      const result = await api(endpoint + "/status", "GET");
+      if (!result.ok) { note(problemText(result), "error"); finish(null); return; }
+      apply(result.body);
+    }
+    async function start(body, ask) {
+      if (ask && !window.confirm(ask)) return;
+      busy(true);
+      note("Signing in to the rate application…");
+      const result = await api(endpoint, "POST", body);
+      if (!result.ok) { note(problemText(result), "error"); busy(false); return; }
+      apply(result.body);
+      if (!polling) polling = setInterval(poll, 2000);
+    }
+
+    // -- one room, on its own row ---------------------------------------
+    //
+    // Sends ONLY that room's typed price, so a half-finished edit three rows
+    // down cannot ride along on a click meant for this one. Always `manual`:
+    // a per-room Preview would be a login and a minute to read one cell the
+    // table above already shows.
+    roomButtons.forEach(function (button) {
+      button.addEventListener("click", function () {
+        const id = button.dataset.roomTypeId;
+        const box = priceBoxes.find(function (b) { return b.dataset.roomTypeId === id; });
+        const changes = {};
+        if (box && edited(box)) changes[id] = Math.round(Number(box.value));
+        const price = box ? Number(box.value) : null;
+        const our = box ? Number(box.dataset.our) : null;
+        const shown = price ? rupees(price) + (our ? " (" + pctText(price, our) + " on today)" : "") : "the rule's price";
+        const picked = channelChoices(id);
+        start(
+          { mode: "manual", overrides: changes, only_room_type_id: Number(id),
+            skip_primary: picked.skip },
+          "Set " + button.dataset.room + " to " + shown + " in RMS now?" + "\n\n"
+            + (picked.lines.length ? "Websites:\n" + picked.lines.join("\n") + "\n\n" : "")
+            + "No other room's rate is touched."
+        );
+      });
+    });
+
+    // -- one room on another website's rule -----------------------------
+    //
+    // Each room in a website's own section has its own Apply: that
+    // website's rule, that room, nothing else. The rule's price only -- a
+    // channel run takes no typed price.
+    laneRoomButtons.forEach(function (button) {
+      button.addEventListener("click", function () {
+        const ch = button.dataset.channel;
+        start(
+          { mode: "manual", channel: ch, only_room_type_id: Number(button.dataset.roomTypeId) },
+          "Set " + button.dataset.room + " on " + ch + " to " + rupees(Number(button.dataset.price))
+            + " in RMS now?\n\nOnly " + ch + "'s row for this room is written. Booking.com and every other room are not touched."
+        );
+      });
+    });
+
+    buttons.forEach(function (button) {
+      button.addEventListener("click", async function () {
+        const changes = overrides();
+        // A typed price skips the rule's percentage limits, so a slip of
+        // one digit would be written. The confirm names every such price.
+        let ask = button.dataset.confirm || "";
+        if (Object.keys(changes).length && button.dataset.mode !== "dry_run") {
+          ask = (ask ? ask + "\n\n" : "") + "Prices you typed (guest price on the site):\n" + describe();
+        }
+        const body = { mode: button.dataset.mode, overrides: changes };
+        if (button.dataset.mode === "manual") {
+          const picked = channelChoices(null);
+          body.skip_primary = picked.skip;
+          if (picked.lines.length) {
+            ask = (ask ? ask + "\n\n" : "") + "Websites:\n" + picked.lines.join("\n");
+          }
+        }
+        await start(body, ask);
+      });
+    });
+    // A run left going when the page was refreshed is still going.
+    api(endpoint + "/status", "GET").then(function (result) {
+      if (result.ok && result.body && result.body.status === "running") {
+        busy(true);
+        apply(result.body);
+        polling = setInterval(poll, 2000);
+      }
+    });
+  });
+
+  // -- another website's rule (Agoda, Goibibo) -------------------------
+  //
+  // Its Preview and Apply start the same job as the buttons above, named
+  // for one channel, and poll the same status. Nothing typed or ticked in
+  // the Booking.com table rides along: the request carries the channel and
+  // the mode, and the worker does that channel alone.
+  document.querySelectorAll("form.lane-run-form").forEach(function (form) {
+    const buttons = Array.from(form.querySelectorAll("button.run"));
+    const status = form.querySelector(".form-status");
+    const endpoint = form.dataset.endpoint;
+    let polling = null;
+    function note(text, cls) {
+      status.hidden = !text;
+      status.className = "form-status " + (cls || "");
+      status.textContent = text || "";
+    }
+    function finish(state) {
+      if (polling) { clearInterval(polling); polling = null; }
+      buttons.forEach(function (b) { b.disabled = false; });
+      if (state && state.status === "done") {
+        note(state.message || "Done.", state.ok ? "ok" : "error");
+        setTimeout(function () { window.location.reload(); }, 2500);
+      }
+    }
+    function apply(state) {
+      if (!state) { finish(null); return; }
+      if (state.status === "running") { note(state.message || "Working…"); return; }
+      finish(state);
+    }
+    async function poll() {
+      const result = await api(endpoint + "/status", "GET");
+      if (!result.ok) { note(problemText(result), "error"); finish(null); return; }
+      apply(result.body);
+    }
+    buttons.forEach(function (button) {
+      button.addEventListener("click", async function () {
+        if (button.dataset.confirm && !window.confirm(button.dataset.confirm)) return;
+        buttons.forEach(function (b) { b.disabled = true; });
+        note("Signing in to the rate application…");
+        const result = await api(endpoint, "POST", { mode: button.dataset.mode, channel: form.dataset.channel });
+        if (!result.ok) { note(problemText(result), "error"); finish(null); return; }
+        apply(result.body);
+        if (!polling) polling = setInterval(poll, 2000);
+      });
+    });
+  });
+
+  // Which room of ours is which on that website, and which of theirs it
+  // competes with. The selects are the interface; the hidden JSON field is
+  // what the form posts, rebuilt on every change so the two cannot drift.
+  document.querySelectorAll("form.lane-form").forEach(function (form) {
+    const field = form.querySelector('input[name="room_pairs"]');
+    const selects = Array.from(form.querySelectorAll("select.lane-pair"));
+    function sync() {
+      const map = {};
+      selects.forEach(function (sel) {
+        if (!sel.value) return;
+        const id = sel.dataset.roomTypeId;
+        (map[id] = map[id] || {})[sel.dataset.side] = sel.value;
+      });
+      field.value = JSON.stringify(map);
+    }
+    selects.forEach(function (sel) { sel.addEventListener("change", sync); });
+    sync();
+  });
+
+  // Adding one: the channel is part of the address, so the form's endpoint
+  // follows the box.
+  document.querySelectorAll("form.lane-add").forEach(function (form) {
+    const box = form.querySelector(".lane-add-channel");
+    const base = form.dataset.endpoint;
+    function aim() { form.dataset.endpoint = base + encodeURIComponent((box.value || "").trim()); }
+    box.addEventListener("change", aim);
+    box.addEventListener("input", aim);
+    aim();
+  });
+
+  // -- manual run, with polling --------------------------------------
+  document.querySelectorAll("button.run-now").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const targetId = button.dataset.targetId;
+      const slot = document.querySelector('.run-status[data-for="' + targetId + '"]');
+      button.disabled = true;
+      if (slot) slot.textContent = "queueing…";
+
+      const result = await api("/api/v1/monitor-targets/" + targetId + "/run", "POST");
+      if (!result.ok) {
+        if (slot) slot.textContent = problemText(result);
+        button.disabled = false;
+        return;
+      }
+      pollCheckRun(result.body.check_run_id, slot, button);
+    });
+  });
+
+  /*
+   * Poll until the run finishes or we give up.
+   *
+   * Every 2s for up to 2 minutes: a browser fetch is 20-40s, plus up to 3
+   * minutes of dispatch jitter is possible on a scheduled run — but a manual
+   * run skips the jitter, so two minutes covers it with room to spare. Giving
+   * up only stops the polling; the run itself continues and its result is on
+   * the hotel page.
+   */
+  function pollCheckRun(checkRunId, slot, button) {
+    let attempts = 0;
+    const timer = setInterval(async function () {
+      attempts += 1;
+      const response = await fetch("/check-runs/" + checkRunId, {
+        credentials: "same-origin",
+      });
+      if (response.ok && slot) slot.innerHTML = await response.text();
+
+      const finished = slot && !slot.textContent.includes("running");
+      if (finished || attempts > 60) {
+        clearInterval(timer);
+        if (button) button.disabled = false;
+        if (attempts > 60 && slot && !finished) {
+          slot.textContent = "still running — see the hotel page";
+        }
+      }
+    }, 2000);
+  }
+
+  // -- one-click actions ---------------------------------------------
+  bindAction("button.resolve-error", function (button) {
+    return { path: "/api/v1/errors/" + button.dataset.errorId + "/resolve", method: "POST" };
+  });
+
+  bindAction("button.resend-notification", function (button) {
+    return {
+      path: "/api/v1/notifications/" + button.dataset.notificationId + "/resend",
+      method: "POST",
+    };
+  });
+
+  bindAction("button.test-notify", function (button) {
+    return {
+      path: "/api/v1/notifications/test",
+      method: "POST",
+      body: {
+        recipient_id: Number(button.dataset.recipientId),
+        channel: button.dataset.channel || "email",
+      },
+      keepPage: true,
+    };
+  });
+
+  bindAction("button.unassign-hotel", function (button) {
+    // Removing the assignment, not the person: their delivery history stays,
+    // and they may still cover other hotels.
+    return {
+      path:
+        "/api/v1/hotels/" + button.dataset.hotelId +
+        "/recipients/" + button.dataset.recipientId,
+      method: "DELETE",
+      confirm:
+        "Stop telling this person about " + button.dataset.hotelName + "?",
+    };
+  });
+
+  bindAction("button.toggle-recipient", function (button) {
+    const activating = button.dataset.active === "true";
+    return {
+      path: "/api/v1/recipients/" + button.dataset.recipientId,
+      method: "PATCH",
+      body: { is_active: activating },
+      // Deactivating is silent by design — nothing errors, the messages just
+      // stop — so it is the one worth asking about.
+      confirm: activating
+        ? null
+        : "Deactivate " + button.dataset.name + "?\n\n" +
+          "Their assignments are kept, but nothing will be sent to them until " +
+          "they are reactivated.",
+    };
+  });
+
+  /*
+   * The irreversible half of the pair above. Deactivating keeps the person and
+   * their log; this removes both, so the dialog spells out what goes rather
+   * than asking "are you sure?" about an amount nobody can see.
+   *
+   * No typed-name gate, unlike a hotel purge: that erases months of collected
+   * prices, which is the product and cannot be re-gathered. This erases one
+   * contact and the record of what was sent to them, which is smaller, and the
+   * reversible alternative is the button directly above it.
+   */
+  bindAction("button.delete-recipient", function (button) {
+    const hotels = Number(button.dataset.hotels || 0);
+    const sent = Number(button.dataset.sent || 0);
+    const goes = [];
+    if (hotels) goes.push(hotels + (hotels === 1 ? " hotel assignment" : " hotel assignments"));
+    if (sent) goes.push(sent + (sent === 1 ? " sent message" : " sent messages"));
+
+    return {
+      path: "/api/v1/recipients/" + button.dataset.recipientId,
+      method: "DELETE",
+      confirm:
+        "Delete " + button.dataset.name + " permanently?\n\n" +
+        (goes.length
+          ? "This also deletes their " + goes.join(" and ") + ".\n\n"
+          : "") +
+        "Nothing can bring this back. To stop the messages without losing " +
+        "anything, use Deactivate instead.",
+    };
+  });
+
+  bindAction("button.resume-target", function (button) {
+    // Closing the circuit also clears the failure counter and makes the target
+    // due immediately — see the API handler.
+    return {
+      path: "/api/v1/monitor-targets/" + button.dataset.targetId,
+      method: "PATCH",
+      body: { circuit_state: "closed" },
+    };
+  });
+
+  function bindAction(selector, describe) {
+    document.querySelectorAll(selector).forEach(function (button) {
+      button.addEventListener("click", async function () {
+        const action = describe(button);
+        // Only for actions that change something a person would miss. A
+        // dialog on every button trains people to dismiss all of them.
+        if (action.confirm && !window.confirm(action.confirm)) return;
+        button.disabled = true;
+        const original = button.textContent;
+        button.textContent = "…";
+
+        const result = await api(action.path, action.method, action.body);
+        if (!result.ok) {
+          button.textContent = original;
+          button.disabled = false;
+          window.alert(problemText(result));
+          return;
+        }
+        if (action.keepPage) {
+          button.textContent = "sent ✓";
+        } else {
+          window.location.reload();
+        }
+      });
+    });
+  }
+
+  // -- phone numbers -------------------------------------------------
+  /*
+   * Meta's Cloud API accepts E.164 and nothing else, so the stored value has
+   * to be +919876543210. Demanding that people TYPE it that way is a different
+   * decision, and a bad one: nobody has the country code in their head for a
+   * number they read off a business card, and a form that rejects the number
+   * as written is a form people give up on.
+   *
+   * So the field takes whatever is natural — 9876543210, 098765 43210,
+   * +91 98765-43210, 0091 98765 43210 — and rewrites it on the way out.
+   * The API stays strict; this is the one place that does the translating.
+   */
+  const DEFAULT_CC = "+91";
+
+  function normalizePhone(raw, defaultCc) {
+    const trimmed = (raw || "").trim();
+    if (!trimmed) return "";
+
+    const explicit = trimmed.charAt(0) === "+";
+    let digits = trimmed.replace(/\D/g, "");
+    if (!digits) return trimmed;
+    if (explicit) return "+" + digits;
+
+    // 00 is the other way of writing +, dialled from most of the world.
+    if (digits.slice(0, 2) === "00") return "+" + digits.slice(2);
+
+    // A leading 0 is the domestic trunk prefix and has no place once the
+    // country code goes on: 09876543210 is +919876543210, not +9109876543210.
+    digits = digits.replace(/^0+/, "");
+
+    const cc = (defaultCc || DEFAULT_CC).replace(/\D/g, "");
+    // Already carries the country code, just without the +. Length is what
+    // separates that from a local number that happens to start with 91.
+    if (digits.slice(0, cc.length) === cc && digits.length > 10) {
+      return "+" + digits;
+    }
+    return "+" + cc + digits;
+  }
+
+  function looksLikeE164(value) {
+    return /^\+[1-9]\d{7,14}$/.test(value);
+  }
+
+  /* Rewrite in place, but only when the result is plausible. Turning a
+     half-typed "98765" into "+9198765" while someone is still typing would
+     fight the person rather than help them. */
+  function tidyPhoneField(field) {
+    const tidied = normalizePhone(field.value, field.dataset.defaultCc);
+    if (tidied && tidied !== field.value && looksLikeE164(tidied)) {
+      field.value = tidied;
+    }
+  }
+
+  document.querySelectorAll("input[data-phone]").forEach(function (field) {
+    field.addEventListener("blur", function () { tidyPhoneField(field); });
+  });
+
+  /* Capture phase, so the value is already E.164 by the time the generic
+     api-form handler reads it — submitting with Enter does not always blur
+     the field first. */
+  document.addEventListener("submit", function (event) {
+    const form = event.target;
+    if (!form || !form.querySelectorAll) return;
+    form.querySelectorAll("input[data-phone]").forEach(tidyPhoneField);
+  }, true);
+
+  // -- registering a recipient ---------------------------------------
+  /*
+   * Contact details only. Which hotels the person watches is a second call to
+   * POST /hotels/{id}/recipients, made from their row once they exist — and
+   * until one is made the dispatcher, which reads hotel_recipients, sends them
+   * nothing. The row says so; this form does not pretend otherwise.
+   *
+   * Not a form.api-form: that handler reloads the page 600ms after "Saved.",
+   * which would take the "not assigned to anything yet" warning with it.
+   */
+  function fieldValue(form, name) {
+    const field = form.querySelector('[name="' + name + '"]');
+    return field ? field.value.trim() : "";
+  }
+
+  function checkedChannels(form) {
+    return Array.prototype.map.call(
+      form.querySelectorAll('input[name="channels"]:checked'),
+      function (box) { return box.value; }
+    );
+  }
+
+  /** The thresholds, omitted rather than sent as null when left blank. */
+  function thresholds(form) {
+    const payload = {};
+    const abs = fieldValue(form, "min_delta_abs");
+    const pct = fieldValue(form, "min_delta_pct");
+    if (abs !== "") payload.min_delta_abs = Number(abs);
+    if (pct !== "") payload.min_delta_pct = Number(pct);
+    return payload;
+  }
+
+  function say(status, text, kind) {
+    if (!status) return;
+    status.hidden = false;
+    status.textContent = text;
+    status.className = "form-status " + (kind || "");
+  }
+
+  /** Assign one person to one hotel. Resolves to an error string, or null. */
+  async function assignHotel(hotelId, body) {
+    const result = await api("/api/v1/hotels/" + hotelId + "/recipients", "POST", body);
+    return result.ok ? null : problemText(result);
+  }
+
+  document.querySelectorAll("form.create-recipient").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const status = form.querySelector(".form-status");
+      const submit = form.querySelector('button[type="submit"]');
+
+      const email = fieldValue(form, "email");
+      const phoneField = form.querySelector('[name="phone_e164"]');
+      const phone = phoneField
+        ? normalizePhone(phoneField.value, phoneField.dataset.defaultCc)
+        : "";
+
+      // The same rules the API enforces, checked before the request so they
+      // read as sentences rather than as a 422 about a regular expression.
+      if (!email && !phone) {
+        say(
+          status,
+          "A recipient needs an email address or a phone number — otherwise " +
+          "there is no way to tell them anything.",
+          "error"
+        );
+        return;
+      }
+      if (phone && !looksLikeE164(phone)) {
+        say(
+          status,
+          "That does not look like a phone number — ten digits for an Indian " +
+          "mobile, or the whole number including its country code.",
+          "error"
+        );
+        return;
+      }
+
+      const payload = { name: fieldValue(form, "name") };
+      if (email) payload.email = email;
+      if (phone) payload.phone_e164 = phone;
+
+      const original = submit.textContent;
+      submit.disabled = true;
+      submit.textContent = "Creating…";
+
+      const created = await api("/api/v1/recipients", "POST", payload);
+      submit.textContent = original;
+      if (!created.ok) {
+        submit.disabled = false;
+        say(status, problemText(created), "error");
+        return;
+      }
+
+      say(
+        status,
+        created.body.name + " created. Expand their row to choose the hotels " +
+        "they watch — nothing is sent until one is assigned.",
+        "ok"
+      );
+      // Long enough to read that sentence, because the next thing to do is in
+      // it and the reload scrolls away from this panel.
+      setTimeout(function () { window.location.reload(); }, 2500);
+    });
+  });
+
+  // -- assigning an existing recipient to one more hotel --------------
+  document.querySelectorAll("form.assign-hotel").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const status = form.querySelector(".form-status");
+      const submit = form.querySelector('button[type="submit"]');
+      const hotelId = fieldValue(form, "hotel_id");
+      const channels = checkedChannels(form);
+
+      if (!hotelId) { say(status, "Choose a hotel.", "error"); return; }
+      if (!channels.length) { say(status, "Pick at least one channel.", "error"); return; }
+
+      submit.disabled = true;
+      const body = Object.assign(
+        { recipient_id: Number(form.dataset.recipientId), channels: channels },
+        thresholds(form)
+      );
+      const error = await assignHotel(Number(hotelId), body);
+
+      if (error) {
+        submit.disabled = false;
+        say(status, error, "error");
+        return;
+      }
+      // The endpoint upserts, so re-assigning a hotel already on the list is
+      // how its channels and thresholds get edited.
+      say(status, "Assigned.", "ok");
+      setTimeout(function () { window.location.reload(); }, 600);
+    });
+  });
+
+  // -- assigning one person to every hotel ----------------------------
+  /*
+   * The endpoint takes one hotel at a time, so this is a loop rather than a
+   * bulk call. Kept in the browser instead of adding a bulk endpoint: each
+   * POST is separately validated and separately audited, and a partial result
+   * is honest -- three of thirty refused because the channel is unconfigured
+   * is worth seeing, not worth rolling back.
+   */
+  document.querySelectorAll("button.assign-all-hotels").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const form = button.closest("form.assign-hotel");
+      if (!form) return;
+      const status = form.querySelector(".form-status");
+      const channels = checkedChannels(form);
+      const hotelIds = Array.prototype.map.call(
+        form.querySelectorAll('select[name="hotel_id"] option[value]:not([value=""])'),
+        function (option) { return Number(option.value); }
+      );
+
+      if (!channels.length) { say(status, "Pick at least one channel.", "error"); return; }
+      if (!hotelIds.length) { say(status, "There are no active hotels.", "error"); return; }
+      if (!window.confirm(
+        "Alert " + button.dataset.name + " about all " + hotelIds.length +
+        " hotels, on " + channels.join(" and ") + "?"
+      )) return;
+
+      const original = button.textContent;
+      button.disabled = true;
+      const failures = [];
+      for (let i = 0; i < hotelIds.length; i += 1) {
+        button.textContent = (i + 1) + " of " + hotelIds.length + "…";
+        const body = Object.assign(
+          { recipient_id: Number(form.dataset.recipientId), channels: channels },
+          thresholds(form)
+        );
+        const error = await assignHotel(hotelIds[i], body);
+        if (error) failures.push(error);
+      }
+      button.textContent = original;
+
+      if (failures.length) {
+        // Named once rather than per hotel: the same refusal thirty times over
+        // is one problem, and thirty lines of it hides that.
+        say(
+          status,
+          failures.length + " of " + hotelIds.length + " could not be assigned — " +
+          failures[0],
+          "error"
+        );
+        setTimeout(function () { window.location.reload(); }, 4000);
+        return;
+      }
+      say(status, "Assigned to all " + hotelIds.length + " hotels.", "ok");
+      setTimeout(function () { window.location.reload(); }, 700);
+    });
+  });
+
+  // -- mapping an unmatched room -------------------------------------
+  document.querySelectorAll("form.resolve-unmatched").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const roomTypeId = form.room_type_id.value;
+      if (!roomTypeId) return;
+
+      const result = await api(
+        "/api/v1/prices/unmatched/" + form.dataset.unmatchedId + "/resolve",
+        "POST",
+        { room_type_id: Number(roomTypeId) }
+      );
+      if (result.ok) {
+        window.location.reload();
+      } else {
+        window.alert(problemText(result));
+      }
+    });
+  });
+  /*
+   * "None of these." Confirmed, because it closes a row a person will not be
+   * shown again -- but no alias is written, so nothing is taught and nothing
+   * is merged, and a name that is real comes straight back next time it is
+   * seen. That makes it the recoverable action of the two on this row.
+   */
+  document.querySelectorAll("button.dismiss-unmatched").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const name = button.dataset.rawName || "this name";
+      if (!window.confirm(
+        "Close \u201c" + name + "\u201d without mapping it to a room?\n\n" +
+        "Nothing is merged and no alias is written. If the site really does " +
+        "have a room by this name, it will appear here again."
+      )) return;
+
+      const result = await api(
+        "/api/v1/prices/unmatched/" + button.dataset.unmatchedId + "/dismiss",
+        "POST",
+        {}
+      );
+      if (result.ok) {
+        window.location.reload();
+      } else {
+        window.alert(problemText(result));
+      }
+    });
+  });
+  // -- stopping and deleting a hotel ---------------------------------
+  /*
+   * Two verbs, deliberately unequal. Stopping is a DELETE that only clears
+   * is_active and disables the targets, so it asks with a plain confirm.
+   * Erasing goes through /purge and makes you type the name — see below.
+   */
+  bindAction("button.deactivate-hotel", function (button) {
+    return {
+      path: "/api/v1/hotels/" + button.dataset.hotelId,
+      method: "DELETE",
+      confirm:
+        "Stop monitoring " + button.dataset.hotelName + "?\n\n" +
+        "Checks stop and it leaves the Matrix. Everything already collected is " +
+        "kept, and resuming picks up where it left off.",
+    };
+  });
+
+  bindAction("button.reactivate-hotel", function (button) {
+    return {
+      path: "/api/v1/hotels/" + button.dataset.hotelId,
+      method: "PATCH",
+      body: { is_active: true },
+    };
+  });
+
+  /*
+   * No confirm dialog here on purpose. A dialog is dismissed by reflex; typing
+   * the hotel's name is the only confirmation that costs enough attention to
+   * be worth anything, and this destroys data nothing in the application can
+   * give back. The server checks the name again — the input is a courtesy to
+   * the operator, not the safeguard.
+   */
+  document.querySelectorAll("form.purge-hotel").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const status = form.querySelector(".form-status");
+      const button = form.querySelector("button[type='submit']");
+
+      button.disabled = true;
+      const result = await api(
+        "/api/v1/hotels/" + form.dataset.hotelId + "/purge",
+        "POST",
+        { confirm_name: form.querySelector("input[name='confirm_name']").value }
+      );
+
+      status.hidden = false;
+      if (!result.ok) {
+        status.textContent = problemText(result);
+        status.className = "form-status error";
+        button.disabled = false;
+        return;
+      }
+
+      const body = result.body || {};
+      status.className = "form-status ok";
+      // Said once, because after the redirect there is nothing left to look at.
+      status.textContent =
+        "Deleted " + body.name + " — " + body.series_deleted + " series, " +
+        body.observations_deleted + " observations, " + body.changes_deleted +
+        " recorded changes.";
+      setTimeout(function () { window.location.href = "/hotels"; }, 2500);
+    });
+  });
+
+  // -- replacing a hotel's booking link ------------------------------
+  /*
+   * Two steps, and only when they are needed. The API refuses with a 409 when
+   * the pasted URL turns out to be a different property, because prices already
+   * collected belong to the old one — and that refusal is what reveals the
+   * confirmation. Someone fixing a typo in a link never sees it.
+   *
+   * Not a form.api-form: the useful part of the answer is what it did (how many
+   * baselines were dropped), and the generic handler reloads the page half a
+   * second after saying "Saved.", which would take that with it.
+   */
+  document.querySelectorAll("form.replace-url").forEach(function (form) {
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const status = form.querySelector(".form-status");
+      const confirmRow = form.querySelector(".confirm-discard");
+      const confirmBox = form.querySelector('input[name="discard_history"]');
+
+      const payload = { url: form.querySelector('input[name="url"]').value };
+      if (confirmBox && confirmBox.checked) payload.discard_history = true;
+
+      const result = await api(
+        "/api/v1/hotel-sources/" + form.dataset.hotelSourceId + "/replace-url",
+        "POST",
+        payload
+      );
+
+      status.hidden = false;
+      if (!result.ok) {
+        status.textContent = problemText(result);
+        status.className = "form-status error";
+        // 409 is the one refusal an operator can answer. A 422 means the URL
+        // itself is unusable — a checkbox would not help, and offering one
+        // would only invite ticking it.
+        if (result.status === 409 && confirmRow) confirmRow.hidden = false;
+        return;
+      }
+
+      const body = result.body || {};
+      status.className = "form-status ok";
+      status.textContent = body.property_changed
+        ? "Repointed. " + body.series_reset + " stored baseline" +
+          (body.series_reset === 1 ? "" : "s") +
+          " dropped, so the next check starts fresh."
+        : "Link updated. Same property, so the price history is untouched.";
+      // Long enough to read the sentence above before the page redraws.
+      setTimeout(function () { window.location.reload(); }, 2500);
+    });
+  });
+
+  // -- read a site at its link's price, or the public one --------------
+  document.querySelectorAll("label.link-deal").forEach(function (label) {
+    const box = label.querySelector('input[type="checkbox"]');
+    const status = label.querySelector(".form-status");
+    box.addEventListener("change", async function () {
+      box.disabled = true;
+      const result = await api(
+        "/api/v1/hotel-sources/" + label.dataset.hotelSourceId + "/link-deal",
+        "POST",
+        { enabled: box.checked }
+      );
+      box.disabled = false;
+      status.hidden = false;
+      if (!result.ok) {
+        box.checked = !box.checked;
+        status.textContent = problemText(result);
+        status.className = "form-status error";
+        return;
+      }
+      status.className = "form-status ok";
+      status.textContent = box.checked
+        ? "Saved. The next check reads the price this link shows — press Run now to see it."
+        : "Saved. The next check reads the public price — press Run now to see it.";
+    });
+  });
+
+  // -- deep link to a collapsed panel ---------------------------------
+  /*
+   * "Edit" in a page head points at a <details> further down. Following the
+   * anchor scrolls to it but leaves it shut, which reads as a broken link.
+   */
+  function openPanelFromHash() {
+    if (!window.location.hash) return;
+    let panel = null;
+    try {
+      panel = document.querySelector(window.location.hash);
+    } catch (e) {
+      return;   // a hash that is not a valid selector is just a hash
+    }
+    if (panel && panel.tagName === "DETAILS") {
+      panel.open = true;
+      panel.scrollIntoView({ block: "start" });
+    }
+  }
+  openPanelFromHash();
+  window.addEventListener("hashchange", openPanelFromHash);
+
+  // -- error detail rows ---------------------------------------------
+  /*
+   * The Errors table on Attention shows one line per failure and expands the
+   * rest underneath: full message, scrubbed context, and the screenshot taken
+   * at the moment it failed.
+   *
+   * Everything but the screenshot is already in the page, so expanding costs
+   * no request. The screenshot's src is withheld until the first expand —
+   * forty unresolved errors would otherwise mean forty PNGs fetched to show a
+   * table nobody has clicked into yet.
+   */
+  document.querySelectorAll("button.error-expand, button.row-expand").forEach(function (button) {
+    button.addEventListener("click", function () {
+      const detail = document.getElementById(button.getAttribute("aria-controls"));
+      if (!detail) return;
+
+      const opening = detail.hidden;
+      detail.hidden = !opening;
+      // aria-expanded, not just a class: the caret is decorative and a screen
+      // reader has nothing else to go on.
+      button.setAttribute("aria-expanded", String(opening));
+      button.classList.toggle("is-open", opening);
+
+      if (opening) {
+        detail.querySelectorAll("img[data-src]").forEach(function (img) {
+          img.src = img.dataset.src;
+          img.removeAttribute("data-src");
+        });
+      }
+    });
+  });
+
+  // -- price-change popups -------------------------------------------
+  /*
+   * Until email and WhatsApp are switched on, this is how a confirmed change
+   * reaches a person: a toast in whichever dashboard tab is open.
+   *
+   * The cursor is the highest price_changes.id this browser has been shown,
+   * kept in localStorage. Deliberately NOT the `notified` column: that one
+   * belongs to the dispatcher, which sets it even when no recipient exists,
+   * so sharing it would let the two silence each other.
+   *
+   * Names in these payloads are scraped from other people's pages, so every
+   * one of them goes in through textContent. No innerHTML in this section.
+   */
+  const CURSOR_KEY = "hpm.changes.cursor";
+  const POLL_MS = 30000;
+  const TOAST_TTL_MS = 20000;
+  const MAX_ON_SCREEN = 4;
+
+  const toastStack = document.getElementById("toast-stack");
+  let polling = false;
+
+  async function pollChanges() {
+    // A slow request must not queue a second one behind it; the next tick
+    // will pick up whatever this one misses.
+    if (polling) return;
+    polling = true;
+    try {
+      const stored = window.localStorage.getItem(CURSOR_KEY);
+      const query = stored === null ? "" : "?since_id=" + encodeURIComponent(stored);
+      const response = await fetch("/changes/recent" + query, {
+        credentials: "same-origin",
+      });
+      // 401 after the session expires: stay quiet. The next navigation gets
+      // the login redirect, which is the right place to notice.
+      if (!response.ok) return;
+
+      const data = await response.json();
+      (data.alerts || []).forEach(showChangeToast);
+      if (data.more) showOverflowToast(data.more);
+      if (data.cursor !== undefined && data.cursor !== null) {
+        window.localStorage.setItem(CURSOR_KEY, String(data.cursor));
+      }
+    } catch (e) {
+      // Offline, or the server is restarting. The cursor is left untouched,
+      // so nothing is lost — the next successful poll shows it.
+    } finally {
+      polling = false;
+    }
+  }
+
+  const TONES = {
+    increase: { tone: "up", word: "Price up" },
+    decrease: { tone: "down", word: "Price down" },
+    became_unavailable: { tone: "gone", word: "Sold out" },
+    became_available: { tone: "back", word: "Back on sale" },
+  };
+
+  function showChangeToast(alert) {
+    // The word carries the meaning and the colour only reinforces it — the
+    // same rule the tables follow, for anyone who cannot tell red from green.
+    const kind = TONES[alert.direction] || { tone: "up", word: "Changed" };
+
+    const toast = element("article", "toast toast-" + kind.tone);
+
+    const head = element("div", "toast-head");
+    head.appendChild(element("span", "toast-label", kind.word));
+    const close = element("button", "toast-close", "×");
+    close.type = "button";
+    close.setAttribute("aria-label", "Dismiss");
+    close.addEventListener("click", function () { dismissToast(toast); });
+    head.appendChild(close);
+    toast.appendChild(head);
+
+    const hotel = element("a", "toast-hotel", alert.hotel);
+    hotel.href = "/hotels/" + alert.hotel_id;
+    toast.appendChild(hotel);
+
+    const room = alert.room + (alert.stay ? " · " + alert.stay : "");
+    toast.appendChild(element("div", "toast-room", room));
+
+    // An overnight move compares two different nights. Saying so on the toast
+    // keeps a reader from assuming the hotel repriced in the last half hour.
+    if (alert.basis === "overnight") {
+      toast.appendChild(element("div", "toast-basis", "vs last night"));
+    }
+
+    const prices = element("div", "toast-prices");
+    prices.appendChild(element("s", "toast-was", alert.was));
+    prices.appendChild(document.createTextNode(" → "));
+    prices.appendChild(element("strong", "toast-now", alert.now));
+    if (alert.delta) {
+      const text = alert.delta + (alert.delta_pct ? " (" + alert.delta_pct + ")" : "");
+      prices.appendChild(element("span", "toast-delta", text));
+    }
+    toast.appendChild(prices);
+
+    toast.appendChild(element("div", "toast-when", alert.when));
+    pushToast(toast);
+  }
+
+  function showOverflowToast(count) {
+    const toast = element("article", "toast toast-more");
+    const link = element("a", "toast-hotel", count + " more change" + (count === 1 ? "" : "s"));
+    link.href = "/changes";
+    toast.appendChild(link);
+    toast.appendChild(element("div", "toast-room", "Too many to show — open Changes."));
+    pushToast(toast);
+  }
+
+  function pushToast(toast) {
+    if (!toastStack) return;
+    toastStack.appendChild(toast);
+    // Beyond four the stack runs off the screen and the oldest is the least
+    // interesting, so it goes rather than the newest being pushed out of view.
+    while (toastStack.children.length > MAX_ON_SCREEN) {
+      toastStack.removeChild(toastStack.firstElementChild);
+    }
+    setTimeout(function () { dismissToast(toast); }, TOAST_TTL_MS);
+  }
+
+  function dismissToast(toast) {
+    if (!toast.parentNode) return;
+    toast.classList.add("toast-leaving");
+    setTimeout(function () {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 200);
+  }
+
+  function element(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  if (toastStack) {
+    pollChanges();
+    setInterval(function () {
+      // A hidden tab has nobody looking at it, and a toast shown there would
+      // expire unseen while still costing a query every 30 seconds.
+      if (!document.hidden) pollChanges();
+    }, POLL_MS);
+    // Returning to a tab left open all afternoon should catch up immediately
+    // rather than waiting out the interval.
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden) pollChanges();
+    });
+  }
+
+  // -- alert sensitivity ---------------------------------------------
+  // One number: how many rupees a price has to move before anybody is told.
+  //
+  // The comparison engine also carries a percentage floor and requires BOTH
+  // to be cleared. Leaving a percentage in place while only the rupee amount
+  // is editable makes the visible setting a lie -- 100 rupees would be silent
+  // on a 25,000 rupee suite, because 0.4% is under a 2% floor, and nothing on
+  // the page would say why. So saving here sets the percentage to zero and
+  // the rupee amount decides on its own.
+  //
+  // ONE ENDPOINT, TWO FORMS, ONE COMPLETE OBJECT
+  // ============================================
+  // /alert-defaults is a PUT: it REPLACES the row. Two forms on this page
+  // write to it -- sensitivity, and the displayed-price switch below it -- and
+  // a form that sent only its own fields would reset the other one's every
+  // time it saved. Someone loosening their alert threshold would have silently
+  // turned tax-inclusive prices back off across the whole site, with nothing
+  // on the page to connect the two.
+  //
+  // So the payload is built from the page rather than from the form: both
+  // controls are read wherever they live, and either Save writes both. The
+  // fields are on one row in the database and they travel as one object.
+  const alertDefaultsPayload = function () {
+    const number = function (name) {
+      const input = document.querySelector(".alert-defaults-form input[name=" + name + "]");
+      return input ? Number(input.value) : null;
+    };
+    const tax = document.querySelector("input[name=show_prices_with_tax]");
+    const summary = document.querySelector("input[name=summary_interval_hours]");
+    const emailOn = document.querySelector("input[name=email_alerts_enabled]");
+    const whatsappOn = document.querySelector("input[name=whatsapp_alerts_enabled]");
+    return {
+      min_delta_abs: number("min_delta_abs"),
+      // The comparison engine requires BOTH floors to be cleared, so leaving a
+      // percentage in place while only the rupee amount is editable makes the
+      // visible setting a lie -- 100 rupees would be silent on a 25,000 rupee
+      // suite, because 0.4% is under a 2% floor, and nothing on the page would
+      // say why. Saving sets it to zero and the rupee amount decides alone.
+      min_delta_pct: 0,
+      confirm_checks: number("confirm_checks"),
+      show_prices_with_tax: tax ? tax.checked : false,
+      // Read off the page like the others: this endpoint REPLACES the row, so
+      // the sensitivity form saving must not switch a channel back on that
+      // somebody has just switched off.
+      email_alerts_enabled: emailOn ? emailOn.checked : true,
+      whatsapp_alerts_enabled: whatsappOn ? whatsappOn.checked : true,
+      // Read off the live input rather than off the page as rendered, so
+      // the sensitivity form -- which PUTs the whole row -- cannot write back
+      // the interval the page loaded with after somebody has edited the box.
+      summary_interval_hours: summary ? Number(summary.value) || 0 : 0,
+    };
+  };
+
+  const saveAlertDefaults = async function (form, status, okText) {
+    say(status, "Saving...", "");
+    const result = await api("/api/v1/alert-defaults", "PUT", alertDefaultsPayload());
+    if (!result.ok) {
+      say(status, problemText(result), "error");
+      return false;
+    }
+    say(status, okText, "ok");
+    return true;
+  };
+
+  document.querySelectorAll("form.alert-defaults-form").forEach(function (form) {
+    const status = form.querySelector(".form-status");
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      // "Within a minute" rather than "saved": the workers cache this, so a
+      // change is not instant and saying so prevents a second save when the
+      // next alert still uses the old figure.
+      await saveAlertDefaults(form, status, "Saved — in effect within a minute.");
+    });
+  });
+
+  // -- the two switches on Settings ----------------------------------
+  // Both live on the alert_defaults row and both are one press: flip, save,
+  // report. Written once because the awkward parts are identical, and getting
+  // either of them subtly different is how one switch ends up honest and the
+  // other ends up showing a state the server never took.
+  //
+  // The switch IS the setting. A styled checkbox waiting on a separate Save
+  // has two states on screen and one in the database, and the gap between them
+  // is silent -- the page sits with the box ticked while the site goes on
+  // behaving the old way until somebody notices the Save.
+  const wireSwitch = function (selector, name, onText, offText, reload) {
+    document.querySelectorAll(selector).forEach(function (form) {
+      const status = form.querySelector(".form-status");
+      form.addEventListener("submit", async function (event) {
+        event.preventDefault();
+        // Flipped BEFORE the payload is built, so the other form on this page
+        // -- which PUTs the whole row -- writes the value we just chose rather
+        // than the one it was rendered with.
+        const box = form.querySelector("input[name=" + name + "]");
+        const knob = form.querySelector(".switch");
+        if (box) box.checked = !box.checked;
+        const on = box && box.checked;
+
+        // Moved BEFORE the request, not after it. A switch that waits for a
+        // round trip before it moves reads as a switch that did not register
+        // the press, and gets pressed again -- which on these controls would
+        // send a second save undoing the first.
+        if (knob) {
+          knob.setAttribute("aria-checked", on ? "true" : "false");
+          knob.disabled = true;
+        }
+
+        const ok = await saveAlertDefaults(form, status, on ? onText : offText);
+
+        // Put it back if the save failed, both the value and the thing on
+        // screen. Leaving it flipped would show a setting the server never
+        // took and make the next press a no-op against it.
+        if (!ok) {
+          if (box) box.checked = !box.checked;
+          if (knob) {
+            knob.setAttribute("aria-checked", box && box.checked ? "true" : "false");
+            knob.disabled = false;
+          }
+        }
+        if (ok && reload) {
+          window.setTimeout(function () { window.location.reload(); }, 600);
+        } else if (ok && knob) {
+          knob.disabled = false;
+        }
+      });
+    });
+  };
+
+  // Displayed prices reloads on success rather than only reporting it: this
+  // switch restates every price on the site, and leaving the page showing the
+  // old numbers under a green "Saved" invites a second save and a bug report.
+  wireSwitch(
+    "form.price-display-form", "show_prices_with_tax",
+    "Saved — prices now include tax.",
+    "Saved — prices now exclude tax.",
+    true
+  );
+
+  // No reload: nothing else on this page restates itself when email stops,
+  // and reloading would lose the reader's place in the four notes beside it
+  // that explain what the switch does and does not cover.
+  wireSwitch(
+    "form.email-alerts-form", "email_alerts_enabled",
+    "Saved — rate alerts will go out by email.",
+    "Saved — no more rate emails. WhatsApp is unaffected.",
+    false
+  );
+
+  wireSwitch(
+    "form.whatsapp-alerts-form", "whatsapp_alerts_enabled",
+    "Saved — rate alerts will go out on WhatsApp.",
+    "Saved — no more rate WhatsApps. Email is unaffected.",
+    false
+  );
+
+  // -- how often the market summary goes out -------------------------
+  // A number with a Save, not a switch: there is no state to flip, and a box
+  // that saved on every keystroke would write 2, then 20, then 24 on the way
+  // to 2 being corrected to 4.
+  //
+  // No reload. Nothing else on this page depends on the interval, and a reload
+  // would only lose the reader's place in the explanation beside the box.
+  document.querySelectorAll("form.summary-interval-form").forEach(function (form) {
+    const status = form.querySelector(".form-status");
+    const input = form.querySelector("input[name=summary_interval_hours]");
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const hours = input ? Number(input.value) || 0 : 0;
+      // "From the next window" rather than "Saved", because the workers cache
+      // this row for a minute and because the first summary arrives when a
+      // window closes, not now. A message that says Saved and is then followed
+      // by an hour of silence reads as a save that did not take.
+      await saveAlertDefaults(
+        form, status,
+        hours > 0
+          ? "Saved — a summary from the end of the next " + hours +
+            (hours === 1 ? " hour window." : " hour window.")
+          : "Saved — market summaries are off."
+      );
+    });
+  });
+
+  // -- per-hotel alert sensitivity -----------------------------------
+  // Not the generic api-form: clearing an override means sending null, and
+  // that handler omits empty fields rather than sending them. An omitted
+  // field is "leave it alone" to a PATCH, so a hotel could be given its own
+  // sensitivity and never handed back to the default again.
+  document.querySelectorAll("form.target-sensitivity").forEach(function (form) {
+    const status = form.querySelector(".form-status");
+    const own = form.querySelector("input[name=own_sensitivity]");
+    const fields = form.querySelector(".sensitivity-fields");
+
+    function reflect() {
+      if (!fields) return;
+      const using = own && own.checked;
+      fields.classList.toggle("is-inherited", !using);
+      fields.querySelectorAll("input").forEach(function (input) {
+        input.disabled = !using;
+      });
+    }
+    if (own) own.addEventListener("change", reflect);
+    reflect();
+
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const using = own && own.checked;
+      const value = function (name) {
+        const input = form.querySelector("input[name=" + name + "]");
+        return input && input.value !== "" ? Number(input.value) : null;
+      };
+      // Nulls, explicitly, when the box is unchecked: that is what hands the
+      // hotel back to the deployment default.
+      const payload = using
+        ? {
+            min_delta_abs: value("min_delta_abs"),
+            // Zero, not null: null would inherit the deployment percentage and
+            // silently raise the bar this hotel was just given.
+            min_delta_pct: 0,
+            confirm_checks: value("confirm_checks"),
+          }
+        : { min_delta_abs: null, min_delta_pct: null, confirm_checks: null };
+
+      say(status, "Saving...", "");
+      const result = await api(
+        "/api/v1/monitor-targets/" + form.dataset.targetId, "PATCH", payload);
+      if (!result.ok) {
+        say(status, problemText(result), "error");
+        return;
+      }
+      say(status, using ? "Saved — this hotel uses its own." : "Saved — back to the default.", "ok");
+    });
+  });
+
+  // -- WhatsApp alert numbers ----------------------------------------
+  // The whole list is PUT on every save, never a delta: a cleared row is how
+  // "stop this number" is expressed, and it only reads as removal if the
+  // server sees the complete set. Sending just the filled rows would leave a
+  // number switched on with no way to switch it off.
+  document.querySelectorAll("form.alert-numbers-form").forEach(function (form) {
+    const rows = form.querySelector(".alert-number-rows");
+    const rowTemplate = form.querySelector(".alert-number-row-template");
+    const addButton = form.querySelector(".alert-number-add");
+    const countLabel = form.querySelector(".alert-number-count");
+    const max = Number(form.dataset.max || 5);
+
+    /** Renumber the visible rows and tell the operator how many are left.
+     *
+     * Called after every add and remove: the labels are positional, so a row
+     * removed from the middle would otherwise leave a gap in the numbering
+     * and make the list look broken.
+     */
+    function refresh() {
+      const all = rows.querySelectorAll(".alert-number-row");
+      all.forEach(function (row, index) {
+        const label = row.querySelector(".row-number");
+        if (label) label.textContent = index + 1;
+      });
+      // The last remaining row is emptied rather than deleted -- a form with
+      // no rows at all offers nowhere to type and looks broken.
+      const only = all.length === 1;
+      all.forEach(function (row) {
+        const remove = row.querySelector(".alert-number-remove");
+        if (remove) remove.title = only ? "Clear this number" : "Remove this number";
+      });
+      if (addButton) addButton.disabled = all.length >= max;
+      if (countLabel) {
+        countLabel.textContent = all.length >= max
+          ? "Five is the maximum."
+          : all.length + " of " + max;
+      }
+    }
+
+    if (addButton && rowTemplate) {
+      addButton.addEventListener("click", function () {
+        if (rows.querySelectorAll(".alert-number-row").length >= max) return;
+        const row = rowTemplate.content.cloneNode(true);
+        rows.appendChild(row);
+        refresh();
+        // Focus the field that was just revealed, so the button press and the
+        // typing are one continuous action.
+        const added = rows.lastElementChild.querySelector("input[name=phone]");
+        if (added) {
+          added.addEventListener("blur", function () { tidyPhoneField(added); });
+          added.focus();
+        }
+      });
+    }
+
+    /* The x on a SAVED row deletes that number, there and then.
+     *
+     * It used to only take the row off the screen, leaving the actual deletion
+     * to the Save button. That reads as done -- the row is gone -- so anybody
+     * who navigated away at that point had changed nothing, and a number they
+     * believed they had stopped went on receiving every price change on every
+     * hotel. The screen and the truth disagreed, silently, in the direction
+     * that costs money.
+     *
+     * A row that has never been saved has no recipient id and nothing to
+     * delete, so it keeps the old behaviour: removed from the form, or
+     * emptied when it is the only one left.
+     */
+    rows.addEventListener("click", async function (event) {
+      const button = event.target.closest(".alert-number-remove");
+      if (!button) return;
+      const row = button.closest(".alert-number-row");
+      const recipientId = row.dataset.recipientId;
+
+      function dropRow() {
+        if (rows.querySelectorAll(".alert-number-row").length === 1) {
+          row.querySelectorAll("input").forEach(function (i) { i.value = ""; });
+          delete row.dataset.recipientId;
+        } else {
+          row.remove();
+        }
+        refresh();
+      }
+
+      if (!recipientId) {
+        dropRow();
+        return;
+      }
+
+      const who = row.dataset.name || "this number";
+      if (!window.confirm(
+        "Stop sending to " + who + "?\n\n" +
+        "It stops receiving immediately. What was already sent to it stays in " +
+        "the delivery history on Alerts, and adding the number again later " +
+        "reconnects to the same record."
+      )) return;
+
+      const status = form.querySelector(".form-status");
+      button.disabled = true;
+      say(status, "Removing " + who + "…", "");
+      const result = await api("/api/v1/alert-numbers/" + recipientId, "DELETE");
+      if (!result.ok) {
+        button.disabled = false;
+        say(status, problemText(result), "error");
+        return;
+      }
+      dropRow();
+      say(status, who + " will not be messaged again.", "ok");
+    });
+
+    refresh();
+
+    form.addEventListener("submit", async function (event) {
+      event.preventDefault();
+      const status = form.querySelector(".form-status");
+
+      // Normalise before reading, not on blur alone: a number pasted into the
+      // field and submitted with Enter never fires a blur event, and would
+      // otherwise be rejected by the E.164 pattern on the server.
+      form.querySelectorAll("input[data-phone]").forEach(tidyPhoneField);
+
+      const numbers = [];
+      const seen = {};
+      let duplicate = null;
+      let unnamed = null;
+      let numberless = null;
+      form.querySelectorAll(".alert-number-row").forEach(function (row) {
+        const phone = row.querySelector("input[name=phone]").value.trim();
+        const label = row.querySelector("input[name=label]").value.trim();
+        // A name typed with no number is not an empty row: somebody meant to
+        // add that person and the digits never landed. Silently dropping it
+        // saves a list they believe has one more entry than it does.
+        if (!phone) {
+          if (label) numberless = label;
+          return;
+        }
+        if (!label) { unnamed = phone; return; }
+        if (seen[phone]) { duplicate = phone; return; }
+        seen[phone] = true;
+        numbers.push({ phone_e164: phone, name: label });
+      });
+
+      // Caught here as well as on the server, because the server's version
+      // rejects the whole save and these name the offending row while the
+      // operator is still looking at it.
+      if (unnamed) {
+        say(status, "Say whose number " + unnamed + " is — the list is unusable "
+                  + "later if nobody can tell whose is whose.", "error");
+        return;
+      }
+      if (numberless) {
+        say(status, "No number for " + numberless + ".", "error");
+        return;
+      }
+      if (duplicate) {
+        say(status, duplicate + " is entered twice. Each number may appear once.", "error");
+        return;
+      }
+
+      say(status, "Saving…");
+      const result = await api("/api/v1/alert-numbers", "PUT", { numbers: numbers });
+      if (!result.ok) {
+        say(status, problemText(result), "error");
+        return;
+      }
+
+      const saved = (result.body && result.body.numbers) || [];
+      const ready = result.body && result.body.whatsapp_ready;
+      if (!saved.length) {
+        say(status, "All alert numbers removed. Nothing will be sent to them.", "ok");
+      } else if (ready) {
+        say(status, saved.length + " number(s) saved. They now get every price change.", "ok");
+      } else {
+        // Saved, but inert. Reported as a warning rather than a success, so
+        // nobody walks away believing alerts are live when they are not.
+        say(status, saved.length + " number(s) saved, but WhatsApp is not "
+                  + "configured yet — nothing will reach them until it is.", "error");
+      }
+      // Reloaded so the summary count and the row values come from the
+      // server's view rather than from what was typed.
+      setTimeout(function () { window.location.reload(); }, 1200);
+    });
+  });
+
+  // -- clearing stored history ---------------------------------------
+  /*
+   * The same sweep the 1st of the month runs, on demand. Not a form.api-form:
+   * the useful part of the answer is what it deleted, and the generic handler
+   * reloads the page a moment after saying "Saved.", which would take the
+   * counts with it before anybody read them.
+   *
+   * A plain confirm rather than a typed name, which is the opposite of the
+   * hotel purge two hundred lines up, and the difference is deliberate. That
+   * one destroys a specific thing that will never come back and can be pressed
+   * by mistake on the wrong hotel. This one applies a standing policy that is
+   * going to run on its own in a few weeks anyway, to rows the deployment has
+   * already decided it does not keep — so the confirmation quotes the number
+   * and the date and asks once, rather than making someone transcribe
+   * something to prove they meant it.
+   */
+  document.querySelectorAll("button.clean-history").forEach(function (button) {
+    button.addEventListener("click", async function () {
+      const expired = Number(button.dataset.expired || 0);
+      if (!expired) return;
+
+      const months = Number(button.dataset.keepMonths || 1);
+      const asked = window.confirm(
+        "Delete " + expired.toLocaleString() + " rows older than " +
+        button.dataset.cutoff + "?\n\n" +
+        "Price changes, check runs, recorded errors and sent messages from " +
+        "before then. The hotels, their links, the schedules and the " +
+        "recipients are untouched, and so is the last price of each room.\n\n" +
+        "Nothing deletes this on a schedule, so it goes only when you press " +
+        "this. Everything from the last " + months + " month" +
+        (months === 1 ? "" : "s") + " is kept. Nothing here can bring the " +
+        "rows back."
+      );
+      if (!asked) return;
+
+      const status = button.parentElement.querySelector(".form-status");
+      const original = button.textContent;
+      button.disabled = true;
+      button.textContent = "…";
+
+      const result = await api("/api/v1/maintenance/history/clean", "POST");
+      if (!result.ok) {
+        button.textContent = original;
+        button.disabled = false;
+        if (status) {
+          status.textContent = problemText(result);
+          status.className = "form-status error";
+        }
+        return;
+      }
+
+      /*
+       * Said before the reload, and given time to be read. A sweep that
+       * deletes nothing looks identical to one that failed if the only
+       * feedback is the page coming back, and the number is the whole point
+       * of having pressed it.
+       */
+      const body = result.body || {};
+      const total = Object.values(body.deleted || {}).reduce(function (a, b) {
+        return a + b;
+      }, 0);
+      const months_dropped = body.observation_partitions_dropped || 0;
+      if (status) {
+        status.hidden = false;
+        status.className = "form-status ok";
+        status.textContent =
+          "Deleted " + total.toLocaleString() + " rows" +
+          (months_dropped
+            ? " and " + months_dropped + " month" +
+              (months_dropped === 1 ? "" : "s") + " of raw readings"
+            : "") + ".";
+      }
+      setTimeout(function () { window.location.reload(); }, 2500);
+    });
+  });
+
+  // -- lists that stop after N rows ----------------------------------
+  // The height comes from the rows, not from a number of pixels: these tables
+  // wrap, so the twelfth row is not at a predictable offset and a fixed height
+  // shows eleven and a half rows on the day somebody's room name got longer.
+  //
+  // Measured by adding up the heights rather than by comparing positions,
+  // because a position inside a box that is already scrolled is relative to
+  // where the reader left it -- which made the box shrink a little every time
+  // the window was resized mid-list.
+  document.querySelectorAll("[data-rows]").forEach(function (box) {
+    const wanted = Number(box.dataset.rows || 0);
+    if (!wanted) return;
+
+    function fit() {
+      const rows = box.querySelectorAll("tbody tr");
+      // Shorter than the cap already: no scrollbar, and no empty band under
+      // the last row either.
+      if (rows.length <= wanted) {
+        box.style.maxHeight = "none";
+        return;
+      }
+      const head = box.querySelector("thead");
+      let height = head ? head.offsetHeight : 0;
+      for (let i = 0; i < wanted; i += 1) height += rows[i].offsetHeight;
+      box.style.maxHeight = height + "px";
+    }
+
+    fit();
+
+    // Rows rewrap when the window narrows, and a height measured at the old
+    // width then hides part of the twelfth row.
+    let pending = null;
+    window.addEventListener("resize", function () {
+      window.clearTimeout(pending);
+      pending = window.setTimeout(fit, 150);
+    });
+  });
+
+})();

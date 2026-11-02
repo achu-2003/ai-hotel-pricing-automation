@@ -1,0 +1,335 @@
+{% extends "base.html" %}
+{% block title %}Price matrix · Hotel Price Monitor{% endblock %}
+
+{% block content %}
+<h1>Price matrix</h1>
+
+{#
+  Occupancy is part of the form, not a hidden default. A 2-guest rate and a
+  3-guest rate are different offers with different offer keys, and a matrix
+  that quietly mixed them would look like a comparison while comparing
+  nothing.
+#}
+<form class="filters" method="get" action="/matrix">
+  <label>Check in <input type="date" name="check_in" value="{{ check_in }}"></label>
+  <label>Check out <input type="date" name="check_out" value="{{ check_out }}"></label>
+  <label>Adults <input type="number" name="adults" min="1" max="20" value="{{ adults }}"></label>
+  <button type="submit">Show</button>
+  {# The note is decided by the route, because what the default IS depends on
+     what has been collected. A form that claims "defaults to the coming
+     weekend" while showing tonight is worse than one that says nothing. #}
+  {% if default_note %}<span class="muted">{{ default_note }}</span>{% endif %}
+  {# Carried through the date/occupancy form so changing the night does not
+     silently drop the category someone is looking at. #}
+  {% if category %}<input type="hidden" name="category" value="{{ category }}">{% endif %}
+  {% if view == 'bands' %}<input type="hidden" name="view" value="bands">{% endif %}
+</form>
+
+{#
+  VIEW. The room cards are what the page has always opened on; "Price
+  comparison" lays the same rooms out in columns of 500 (see _price_bands).
+  Links, like the category chips, so either view can be bookmarked.
+#}
+{% set qs = "check_in=%s&check_out=%s&adults=%s"|format(check_in, check_out, adults) %}
+{% set cat_qs = '&category=' ~ category if category else '' %}
+{% set view_qs = '&view=bands' if view == 'bands' else '' %}
+<div class="chips chips-filter">
+  <span class="chips-label">View</span>
+  <a class="chip {{ 'is-on' if view != 'bands' }}" href="/matrix?{{ qs }}{{ cat_qs }}">Rooms</a>
+  <a class="chip {{ 'is-on' if view == 'bands' }}" href="/matrix?{{ qs }}{{ cat_qs }}&view=bands">Price comparison</a>
+</div>
+
+{#
+  ROOM CATEGORY FILTER
+  ====================
+  Room names do not line up across properties -- "Club Room", "Classic Room"
+  and "Deluxe Room" are the same tier at three different hotels -- so the
+  categories are worked out from the name (app/services/room_category.py) and
+  the chips below narrow the grid to one of them.
+
+  Links rather than a <select>: each state is a URL that can be bookmarked and
+  pasted into a message, and the page needs no JavaScript to apply it. Counts
+  are of every room priced tonight, so they do not change when a chip is
+  chosen and there is always a way back.
+#}
+{% if chips %}
+<div class="chips chips-filter">
+  <span class="chips-label">Room category</span>
+  <a class="chip {{ 'is-on' if not category }}" href="/matrix?{{ qs }}{{ view_qs }}">All</a>
+  {% for chip in chips %}
+  <a class="chip {{ 'is-on' if category == chip.slug }}"
+     href="/matrix?{{ qs }}&category={{ chip.slug }}{{ view_qs }}">
+    {{ chip.label }}<span class="chip-count">{{ chip.count }}</span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if rows and view == 'bands' %}
+<div class="matrix-actions">
+  <a class="btn btn-export"
+     href="/matrix/export?check_in={{ check_in }}&check_out={{ check_out }}&adults={{ adults }}{% if category %}&category={{ category }}{% endif %}">
+    ↓ Download Excel
+  </a>
+</div>
+{% endif %}
+
+{% if rows %}
+<div class="scroll-x">
+{% if view == 'bands' %}
+{#
+  BY PRICE BAND. One column per {{ band_step }} of price, so reading across a
+  row walks up the price ladder and reading down a column shows who sells in
+  that range tonight. A column heading is where its band starts: "₹1,500"
+  holds 1,500 up to 1,999. Only bands with a room in them tonight are
+  columns (see _price_bands).
+#}
+<table class="grid matrix matrix-bands">
+  <thead>
+    <tr>
+      <th class="band-hotel">Hotel</th>
+      {% for start in bands %}
+      <th class="num band-head" title="{{ money(start, 'INR') }} – {{ money(start + band_step - 1, 'INR') }}">{{ money(start, 'INR') }}</th>
+      {% endfor %}
+      <th class="band-head">Sold out</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr class="{{ 'own-property' if row.hotel.is_own_property else '' }}">
+      <td class="band-hotel">
+        <a href="/hotels/{{ row.hotel.id }}">{{ row.hotel.name }}</a>
+        {% if row.hotel.is_own_property %}<span class="pill pill-own">yours</span>{% endif %}
+      </td>
+      {% for start in bands %}
+      <td class="band-cell">
+        {% for cell in row.bands.get(start, []) %}
+        <span class="band-room {{ 'cell-changed' if cell.changed_recently else '' }}"
+              title="{{ cell.category_label }} · last checked {{ cell.last_checked_at|localtime('%d %b %H:%M') }}">
+          <span class="cell-room">{{ cell.room_name }}</span>
+          <span class="cell-price">{{ money(cell.price, cell.currency) }}</span>
+          {% if cell.price_note %}<span class="cell-basis">{{ cell.price_note }}</span>{% endif %}
+        </span>
+        {% endfor %}
+      </td>
+      {% endfor %}
+      {#
+        Sold-out rooms keep their last rate, muted and prefixed, and never in
+        a price column: that figure is not a rate anyone can book tonight.
+      #}
+      <td class="band-cell">
+        {% if row.sold_out and not row.cells %}
+        <span class="band-room cell-soldout"
+              title="Checked {{ row.checked_at|localtime('%d %b %H:%M') }} · this source lists no rooms on a full night">
+          <span class="cell-room">no rooms listed</span>
+        </span>
+        {% endif %}
+        {% for cell in row.sold_out_cells %}
+        <span class="band-room cell-soldout">
+          <span class="cell-room">{{ cell.room_name }}</span>
+          {% if cell.price %}
+          <span class="cell-was">
+            {%- if cell.for_night -%}
+              {{ cell.for_night.strftime('%d %b') }} {{ money(cell.price, cell.currency) }}
+            {%- else -%}
+              was {{ money(cell.price, cell.currency) }}
+            {%- endif -%}
+          </span>
+          {% endif %}
+        </span>
+        {% endfor %}
+        {% if row.sold_out and row.next_priced %}
+        <a class="onward"
+           href="/matrix?check_in={{ row.next_priced[0] }}&check_out={{ row.next_priced[1] }}&adults={{ adults }}&view=bands">
+          see {{ row.next_priced[0].strftime('%d %b') }} →
+        </a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<table class="grid matrix">
+  <thead>
+    {# The cheapest column means the cheapest of what is SHOWN, so under a
+       filter it is the cheapest room of that category and the heading has to
+       say so -- otherwise it reads as the property's floor rate. #}
+    <tr>
+      <th>Hotel</th>
+      <th class="num">{{ 'Cheapest ' ~ category_label if category_label else 'Cheapest' }}</th>
+      <th>{{ category_label if category_label else 'Rooms' }}</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr class="{{ 'own-property' if row.hotel.is_own_property else '' }}">
+      <td>
+        <a href="/hotels/{{ row.hotel.id }}">{{ row.hotel.name }}</a>
+        {% if row.hotel.is_own_property %}<span class="pill pill-own">yours</span>{% endif %}
+      </td>
+      <td class="num strong">{{ money(row.cheapest, row.cells[0].currency if row.cells else 'INR') }}</td>
+      <td>
+        {#
+          A property with no cells was checked and came back full, with an
+          engine that omits its rooms rather than labelling them sold out.
+          Saying so beats an empty line: the line reads as a missing fetch,
+          and the fetch is the one thing that definitely happened.
+        #}
+        {#
+          Only when the hotel has no priced night to borrow from at all --
+          nothing collected since it filled. A hotel that HAS one gets a card
+          per room below, the same as every other full property.
+        #}
+        {% if row.sold_out and not row.cells %}
+        <div class="cells">
+          <span class="cell cell-soldout"
+                title="Checked {{ row.checked_at|localtime('%d %b %H:%M') }} · this source lists no rooms on a full night">
+            <span class="cell-room">no rooms listed</span>
+            <span class="cell-price">sold out</span>
+          </span>
+          {#
+            The date is part of the sentence, never dropped. These properties
+            priced no room for the night being shown, so this figure belongs
+            to a different one -- and a rate shown without its date is the
+            single worst thing this screen could print. "06 Sep from 7,500"
+            reads as one claim; "from 7,500" beside a 05 Sep grid reads as
+            tonight's, and would be wrong.
+          #}
+          {% if row.next_priced %}
+          <a class="onward"
+             href="/matrix?check_in={{ row.next_priced[0] }}&check_out={{ row.next_priced[1] }}&adults={{ adults }}">
+            see {{ row.next_priced[0].strftime('%d %b') }} →
+          </a>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="cells">
+          {% for cell in row.cells %}
+          <span class="cell {{ 'cell-changed' if cell.changed_recently else '' }}
+                       {{ 'cell-soldout' if not cell.is_available else '' }}"
+                title="{{ cell.category_label }} · last checked {{ cell.last_checked_at|localtime('%d %b %H:%M') }}"
+                data-category="{{ cell.category }}">
+            <span class="cell-room">{{ cell.room_name }}</span>
+            <span class="cell-price">
+              {% if cell.is_available %}{{ money(cell.price, cell.currency) }}
+              {% else %}sold out{% endif %}
+            </span>
+            {#
+              THE LAST RATE, UNDER "SOLD OUT" AND NEVER INSTEAD OF IT
+              ======================================================
+              A full room still says what the hotel was asking before it
+              filled, and that is the number a competitor decision needs --
+              "they sold out at 6,426" is intelligence, while a blank cell is
+              only an absence.
+
+              But it is not a price anybody can book, so it never takes the
+              place of the words. "sold out" stays the loud line and the rate
+              sits under it, muted and prefixed, because a bare figure in this
+              cell would read as availability and the whole system's rule is
+              that a sold-out room is never quoted a price.
+
+              Deliberately not struck through: a strike means "was this, now
+              less", and this room is not on sale at any figure.
+
+              ingest keeps the value for exactly this: a sold-out check
+              carries no price, and blanking the last known rate would lose it
+              for as long as the room stays full.
+            #}
+            {% if not cell.is_available and cell.price %}
+            <span class="cell-was">
+              {%- if cell.for_night -%}
+                {{ cell.for_night.strftime('%d %b') }} {{ money(cell.price, cell.currency) }}
+              {%- else -%}
+                was {{ money(cell.price, cell.currency) }}
+              {%- endif -%}
+            </span>
+            {% endif %}
+            {# Only where this site published one component and not the other.
+               A marker on every cell would be noise; here it is the whole
+               warning -- without it a pre-tax rate sits beside an all-in one
+               and reads as a competitor undercutting by 15%.
+
+               On a sold-out cell too, now that one carries a figure: a "was"
+               that is quietly pre-tax beside neighbours that are not is the
+               same misreading, and it does not stop being one because the
+               room is full. #}
+            {% if cell.price_note and cell.price %}
+            <span class="cell-basis">{{ cell.price_note }}</span>
+            {% endif %}
+          </span>
+          {% endfor %}
+          {# After the rooms, not before them: it is a way out of this row, and
+             a link ahead of the cards reads as a label for them. #}
+          {% if row.sold_out and row.next_priced %}
+          <a class="onward"
+             href="/matrix?check_in={{ row.next_priced[0] }}&check_out={{ row.next_priced[1] }}&adults={{ adults }}">
+            see {{ row.next_priced[0].strftime('%d %b') }} →
+          </a>
+          {% endif %}
+        </div>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+</div>
+{#
+  A highlighted cell used to mean "changed in the last 24 hours" only to
+  whoever had read this template. Stated beneath the grid, it means that to
+  everyone looking at it.
+#}
+<div class="legend">
+  <span class="legend-item"><span class="legend-swatch legend-changed"></span>changed in the last 24 hours</span>
+  <span class="legend-item">
+    {% if show_with_tax %}
+      prices <strong>include tax</strong>; <em>excl. tax</em> marks a room whose
+      site published no tax figure
+    {% else %}
+      prices are <strong>before tax</strong>; <em>incl. tax</em> marks a room
+      whose site published no pre-tax figure
+    {% endif %}
+    — change it on Settings
+  </span>
+  <span class="legend-item"><span class="legend-swatch legend-soldout"></span>sold out — never a price of zero; “was …” is the last rate seen before the room filled and a dated price is another night's, neither one you can book tonight; “no rooms listed” is a full night on an engine that omits its rooms rather than labelling them</span>
+  <span class="legend-item"><span class="legend-own"></span>your property</span>
+  <span class="legend-note">
+    Prices are the last confirmed value per offer, not the latest raw reading.
+  </span>
+</div>
+{% elif filtered_out %}
+{# The night has prices; the category has none. Saying "nothing collected"
+   here would send someone off to debug a fetcher that is working fine. #}
+<p class="muted">
+  No {{ category_label }} is priced for this night. The chips above list the
+  categories that are, and a room lands in one by its name — a room nobody
+  recognises here is usually a room whose name says less than it could.
+</p>
+{% else %}
+<p class="muted">
+  Nothing has been collected for these dates and occupancy yet. Prices appear
+  once a monitor target covering this stay window has run successfully.
+</p>
+{% if collected %}
+{# The nights that DO have prices. A blank page invites "is it broken?", and
+   the honest answer is usually "nothing is watching that night" -- which is
+   visible the moment the collected windows are listed beside it. #}
+<p class="muted">
+  Collected so far:
+  {% for night in collected %}
+  <a href="/matrix?check_in={{ night[0] }}&check_out={{ night[1] }}&adults={{ night[2] }}">
+    {{ night[0].strftime('%d %b') }}–{{ night[1].strftime('%d %b') }}
+    {%- if night[2] != adults %} ({{ night[2] }} adults){% endif -%}
+  </a>{% if not loop.last %} · {% endif %}
+  {% endfor %}
+</p>
+<p class="muted">
+  A night that is not listed has nothing watching it. Monitor targets carry a
+  lead time — a target at 7 days out collects the night a week ahead — so a
+  window nobody covers stays blank however often the checks run.
+</p>
+{% endif %}
+{% endif %}
+{% endblock %}

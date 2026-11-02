@@ -1,0 +1,1956 @@
+/*
+ * Dashboard styling.
+ *
+ * Plain CSS, no framework and no build step: this is a dozen screens of dense
+ * tables, and a utility-class framework would cost a toolchain to save
+ * nothing. Everything derives from the tokens below, so changing spacing or
+ * colour happens in one place rather than twelve.
+ *
+ * THREE RULES THE WHOLE SHEET FOLLOWS
+ * ===================================
+ * 1. Colour never carries meaning alone. Every state also has a word -- "sold
+ *    out", "stale", "paused" -- so the screens stay readable for anyone who
+ *    cannot separate red from green, and in a screenshot pasted into a chat.
+ * 2. Numbers that get compared are tabular and right-aligned. Prices in a
+ *    column that do not line up are measurably slower to scan, and comparing
+ *    prices is the entire job.
+ * 3. Colour is loud at the edges -- the bar, the tile caps, the buttons -- and
+ *    quiet inside the data. The tables are where the work happens, and a
+ *    rainbow behind a price column makes the price harder to read, not
+ *    easier. So the chrome carries the personality and the rows stay near
+ *    white; the only saturated fills inside a table are the ones that mean
+ *    something, and each of those still has a word next to it.
+ */
+
+/* -- tokens ---------------------------------------------------------- */
+:root {
+  /* Text sits on warm paper, so the greys carry a faint green-grey cast: a
+     dead-neutral grey over a cream wash reads as dirty, and an indigo-leaning
+     one (what this was) reads as cold against it. */
+  --ink:        #16211e;
+  --ink-2:      #3b4b47;
+  /* 4.6:1 on the cream, 5.3:1 on a panel. The old grey was 4.4:1 on the
+     old page colour -- under the line, and this palette is lighter still,
+     so it goes a step darker rather than inheriting a near-miss. */
+  --muted:      #626f69;
+  --line:       #e0dbcd;
+  --line-soft:  #efebe0;
+  --bg:         #f2efe7;   /* the requested cream */
+  --panel:      #ffffff;
+
+  /* THE BAR COLOUR, and why nothing else uses it.
+     #7cd5c7 is a light mint: its relative luminance is .56, so white text on
+     it lands at 1.7:1 -- about a quarter of the 4.5:1 that counts as legible.
+     It is a surface colour, not a fill to put white on. So it dresses the one
+     big chrome surface and carries dark ink, and everything that needs white
+     text (buttons, tile caps, the active pill) uses the deeper ramp below. */
+  --bar:        #7cd5c7;
+  --bar-ink:    #10312c;   /* 10.5:1 on the bar */
+  --bar-line:   #63c5b5;
+
+  /* The brand ramp: the same hue as the bar, taken down far enough to hold
+     white text. Three stops, always used in this order, so every gradient on
+     the page looks like it came from one light source. */
+  --brand-1:   #0b7267;   /* deep teal -- white text sits at 5.8:1 */
+  --brand-2:   #14907f;
+  --brand-3:   #2fae9b;
+  --grad-brand: linear-gradient(100deg, var(--brand-1), var(--brand-2) 52%, var(--brand-3));
+
+  /* Semantics: up is bad for us (a competitor raised), down is good. These
+     stay close to the classic red and green, because that is how every
+     hotelier already reads a rate sheet. The new colours went everywhere
+     else instead. */
+  --up:        #c02626;
+  --up-2:      #f43f5e;
+  --up-bg:     #fef2f2;
+  --down:      #047857;
+  --down-2:    #10b981;
+  --down-bg:   #ecfdf5;
+  --warn:      #b45309;
+  --warn-2:    #f59e0b;
+  --warn-bg:   #fffbeb;
+  --accent:    #0b7267;
+  --accent-2:  #14907f;
+  --accent-bg: #e4f4f0;
+
+  /* One spacing scale keeps vertical rhythm consistent across pages. */
+  --s1: 4px;  --s2: 8px;  --s3: 12px; --s4: 16px;
+  --s5: 24px; --s6: 32px; --s7: 48px;
+
+  --radius:    12px;
+  --radius-sm: 7px;
+
+  /* Tinted rather than grey: a neutral black shadow over cream looks like a
+     smudge. Warmed towards the paper so it reads as depth, not dirt. */
+  --shadow:       0 1px 2px rgba(74,64,40,.06), 0 2px 6px rgba(74,64,40,.07);
+  --shadow-lg:    0 4px 10px -2px rgba(74,64,40,.10), 0 14px 32px -8px rgba(74,64,40,.16);
+  --shadow-brand: 0 2px 6px rgba(11,114,103,.26);
+
+  /* Default cap colour for a tile; overridden per tile further down. */
+  --tile-accent: var(--grad-brand);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+/* The `hidden` attribute is only `display: none` in the browser's own
+   stylesheet, so any class rule that sets a display — `.stack label` sets
+   flex — silently wins and the element shows anyway. Every progressive
+   disclosure here hangs off `hidden`, so it is made to mean what it says. */
+[hidden] { display: none !important; }
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  /* Two faint washes pinned to the top corners over the flat page colour.
+     Fixed, so they do not scroll away and leave the bottom of a long table
+     sitting on bare grey. */
+  background:
+    radial-gradient(900px 420px at 8% -8%,  rgba(124,213,199,.30), transparent 65%),
+    radial-gradient(760px 380px at 96% -4%, rgba(20,144,127,.12), transparent 62%),
+    var(--bg);
+  background-attachment: fixed;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* Keyboard users should never have to guess where they are. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+
+/* -- top bar --------------------------------------------------------- */
+/*
+ * The one genuinely saturated surface in the product. It is on every screen
+ * and it holds no data, so it is where the thing gets to have a colour
+ * without competing with a price.
+ */
+.topbar {
+  display: flex; align-items: center; gap: var(--s5);
+  height: 56px; padding: 0 var(--s5);
+  background: var(--bar);
+  border-bottom: 1px solid var(--bar-line);
+  box-shadow: 0 1px 12px rgba(16,49,44,.16);
+  position: sticky; top: 0; z-index: 20;
+  color: var(--bar-ink);
+}
+.brand {
+  font-weight: 650; font-size: 15px; color: var(--bar-ink);
+  letter-spacing: -.01em; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: var(--s2);
+}
+.brand:hover { text-decoration: none; }
+/* A small deep-teal dot, so the bar carries a mark and not only words. It was
+   mint on violet; on a mint bar the same mint is invisible. */
+.brand::before {
+  content: ""; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--brand-1); box-shadow: 0 0 0 3px rgba(11,114,103,.18);
+  flex: 0 0 auto;
+}
+
+.topbar nav { display: flex; gap: var(--s1); align-items: center; }
+.topbar nav a {
+  color: rgba(16,49,44,.74); padding: 6px 11px; border-radius: 999px;
+  font-weight: 500; white-space: nowrap;
+  transition: background-color .14s ease, color .14s ease;
+}
+.topbar nav a:hover { background: rgba(255,255,255,.45); color: var(--bar-ink); text-decoration: none; }
+/* The current page, marked by weight and a solid chip rather than a heavy bar. */
+.topbar nav a.active {
+  background: #fff; color: var(--brand-1); font-weight: 650;
+  box-shadow: 0 1px 3px rgba(16,49,44,.20);
+}
+
+.topbar .user {
+  margin-left: auto; display: flex; align-items: center; gap: var(--s3);
+  color: rgba(16,49,44,.72); font-size: 13px;
+}
+.topbar .user a { color: var(--bar-ink); font-weight: 550; }
+
+main { padding: var(--s5); max-width: 1360px; margin: 0 auto; }
+footer { padding: var(--s5) var(--s5) var(--s6); color: var(--muted); font-size: 12px; text-align: center; }
+
+/* -- typography ------------------------------------------------------ */
+h1 { font-size: 24px; font-weight: 650; letter-spacing: -.02em; margin: 0 0 var(--s1); }
+h2 {
+  font-size: 15px; font-weight: 650; letter-spacing: -.01em;
+  margin: var(--s6) 0 var(--s3);
+  display: flex; align-items: center; gap: var(--s2);
+}
+/* A short gradient rule in front of every section heading. It breaks a long
+   page into blocks at a glance without putting a box around each one. */
+h2::before {
+  content: ""; width: 4px; height: 15px; border-radius: 2px;
+  background: var(--grad-brand); flex: 0 0 auto;
+}
+/* Two headings are labels rather than section titles, and a 15px bar next to
+   11px text reads as a stray mark. */
+.muted-head::before, .setup-title::before { display: none; }
+h2 .muted { font-weight: 400; font-size: 13px; }
+.muted-head {
+  color: var(--muted); font-size: 11px; font-weight: 650;
+  text-transform: uppercase; letter-spacing: .07em;
+}
+section { margin-bottom: var(--s5); }
+section > h2:first-child { margin-top: 0; }
+
+.page-head { display: flex; align-items: flex-start; gap: var(--s4); flex-wrap: wrap; margin-bottom: var(--s5); }
+.page-head p { margin: 0; }
+.page-head > a, .page-head .btn-link { margin-left: auto; align-self: center; }
+/* One coloured word per screen: the title carries the ramp itself, so the
+   page announces itself without needing a banner. */
+.page-head h1 {
+  background: var(--grad-brand);
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  width: fit-content;
+}
+/* Clipping the background to the text clips it to descendant glyphs too, so a
+   pill sitting in the hotel title would lose its own ink. It gets it back. */
+.page-head h1 .pill { -webkit-text-fill-color: initial; }
+
+/* -- tables ---------------------------------------------------------- */
+.grid {
+  width: 100%; border-collapse: separate; border-spacing: 0;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden;
+}
+/*
+ * A solid indigo band. The sheet's third rule -- colour loud at the edges,
+ * quiet inside the data -- applies to a table's own edge as much as to the
+ * page's: the header holds no numbers, so it can carry weight without making
+ * a single price harder to read, and the rows below stay near white.
+ *
+ * It also does the job the pale version only half did. These labels are 11px
+ * uppercase, the hardest text on the screen to read, and they were set in a
+ * mid-tone lavender on a near-white band.
+ */
+.grid th {
+  text-align: left; font-size: 11px; font-weight: 650;
+  letter-spacing: .06em; text-transform: uppercase; color: #fff;
+  padding: 11px var(--s4);
+  background: linear-gradient(180deg, var(--brand-1), #095e55);
+  border-bottom: 1px solid #07514a; white-space: nowrap;
+}
+/* Rounded corners live on .grid, which clips its children -- except a sticky
+   or shadowed header, which needs its own radius to sit inside them cleanly. */
+.grid thead tr:first-child th:first-child { border-top-left-radius: var(--radius); }
+.grid thead tr:first-child th:last-child  { border-top-right-radius: var(--radius); }
+/* A header over a right-aligned column belongs on the right too. Left-aligned
+   above tabular numbers it sits at the far side of its own column, which reads
+   as belonging to the column before it -- the wider the column, the worse. */
+.grid th.num { text-align: right; }
+/* THE SMALL PRINT IN A HEADER IS STILL PRINT. "with tax", "vs Competitor A",
+   "(not applied)" -- each one qualifies the column it sits in, and each one
+   took the page's --muted, a grey chosen for near-white rows. On the dark
+   green band that lands around 1.5:1: the words are there and cannot be read.
+   The header's own white, dialled back, so they stay secondary to the label
+   above them and still clear the contrast line. */
+.grid th .muted,
+.grid th small { color: rgba(255, 255, 255, .88); }
+.grid td { padding: 11px var(--s4); border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+.grid tbody tr:first-child td { padding-top: 13px; }
+.grid tbody tr:last-child td { border-bottom: none; }
+.grid tbody tr:hover td { background: #f8f8ff; }
+
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.strong { font-weight: 600; }
+.muted { color: var(--muted); }
+.nowrap { white-space: nowrap; }
+.truncate { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/*
+ * max-width, overflow and text-overflow are all ignored on a NON-REPLACED
+ * INLINE box, so a <span class="truncate"> kept only the nowrap and ran its
+ * one line as far as the text went -- widening the cell, the table and the
+ * page behind it. It has to be a block (or a flex item, which is why the same
+ * class works inside .error-expand) before any of the clipping applies.
+ */
+span.truncate { display: block; }
+.up { color: var(--up); font-weight: 600; }
+.down { color: var(--down); font-weight: 600; }
+/* The two tinted rows also get a solid edge, so they survive a greyscale
+   print and a screenshot run through a filter. */
+.row-alarm td { background: var(--up-bg); }
+.row-alarm td:first-child { box-shadow: inset 3px 0 0 var(--up-2); }
+.own-property td { background: var(--accent-bg); }
+.own-property td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+.scroll-x { overflow-x: auto; border-radius: var(--radius); }
+
+/* -- a table too wide for the window, with its edges pinned ------------
+ *
+ * The comparison grid is seven room categories across, each wide enough to
+ * keep a gap pill on one line. That is wider than the window, and .scroll-x
+ * on its own does not solve it -- it scrolls, but the box is as tall as the
+ * table, so the horizontal scrollbar lands eighteen hundred pixels down the
+ * page. Measured on the real grid: a 1,312px box, a 1,404px table, and a
+ * scrollbar at y=1927 on a 2,460px page. The last column read as cut off
+ * rather than as scrollable, which is the same thing as missing.
+ *
+ * So the table gets a pane of its own with both scrollbars in view, and the
+ * two things you navigate by are pinned:
+ *
+ *   the category headings, or scrolling down leaves seven columns of rupee
+ *   amounts with nothing saying which tier each one is
+ *
+ *   the resort column, or scrolling right leaves a row of prices with no
+ *   property attached -- worse here than on an ordinary table, because every
+ *   number in the row is a comparison and the thing compared is the row label
+ *
+ * WHY .grid's OWN overflow HAS TO GO. `overflow: hidden` makes an element a
+ * scroll container, so a sticky cell inside .grid sticks to .grid -- which
+ * never scrolls -- and quietly does nothing at all. The clipping and the
+ * rounded corners move out to the pane, which is the thing that scrolls.
+ */
+.scroll-grid {
+  overflow: auto;
+  /* THE PANE HAS TO FIT THE WINDOW, and the subtrahend is why. It is roughly
+     the page furniture above the table -- bar, title, filter card, margins --
+     because a pane taller than the space left over pushes its own horizontal
+     scrollbar below the fold, which is the entire bug this rule exists to
+     fix. Worse than that: reaching the scrollbar by scrolling the PAGE lifts
+     the pane's pinned heading out of view with it, so you would arrive at the
+     control having lost the labels it is there to help you read.
+
+     Measured against the real page: furniture ends at y=275, so at a 850px
+     window this leaves the pane's bottom edge at 821 -- on screen, with the
+     table self-contained and the page barely scrolling at all. */
+  max-height: calc(100vh - 19rem);
+  min-height: 18rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  background: var(--panel);
+  /* The pane is what has an edge now, so the table inside it must not paint a
+     second one a pixel away from the first. */
+}
+.scroll-grid > .grid {
+  width: 100%; min-width: min-content;
+  border: none; border-radius: 0; box-shadow: none; overflow: visible;
+}
+.scroll-grid thead th { position: sticky; top: 0; z-index: 3; }
+/* Both pinned at once, so the corner cell has to outrank each of them or it
+   is overrun by whichever neighbour is scrolling past. */
+.scroll-grid thead th:first-child { z-index: 4; }
+.scroll-grid tbody td:first-child {
+  position: sticky; left: 0; z-index: 2;
+  /* Opaque, or the columns scroll THROUGH it. Set at the lowest specificity
+     of the three, so the tinted and hovered rows below still win. */
+  background: var(--panel);
+}
+/* The pinned column's own edge. A border rather than a shadow: the own-property
+   row already spends its box-shadow on the accent bar down its left side, and
+   two shadows on one cell would have to be written as one rule in two places. */
+.scroll-grid thead th:first-child,
+.scroll-grid tbody td:first-child { border-right: 1px solid var(--line); }
+.scroll-grid .own-property td:first-child { background: var(--accent-bg); }
+.scroll-grid tbody tr:hover td:first-child { background: #f8f8ff; }
+/* width:100% inside a scrolling box means "the box's width", which would let
+   the table shrink back to the space available and wrap everything it was
+   supposed to be allowed to overflow. min-content is the width it actually
+   needs; it still stretches to fill anything wider. */
+.scroll-x > .grid { width: 100%; min-width: min-content; }
+
+/* -- a list that stops after twelve rows -----------------------------
+ *
+ * Changes and the delivery history both fetch up to three hundred rows, and
+ * three hundred rows is a page whose own filters scroll off the top the
+ * moment somebody starts reading. Worse, the row that matters is nearly
+ * always in the first few: both lists are newest first.
+ *
+ * So the box keeps twelve in view and takes the rest to its own scrollbar.
+ * Nothing is dropped -- the same rows are there, in the same order.
+ *
+ * The exact height is set in JS from the rows themselves, because these rows
+ * wrap: a long room name, a stay window, a provider's error text. A height in
+ * pixels would cut one of them in half on the day it wrapped. The max-height
+ * here is the fallback a browser with no JS gets -- about twelve one-line
+ * rows, and never the whole three hundred.
+ */
+.scroll-rows { overflow-y: auto; max-height: 33rem; }
+.scroll-rows > .grid { width: 100%; min-width: min-content; }
+/* The header has to survive the scroll. Without this, everything from row
+   thirteen down is nine unlabelled columns, and "Was" and "Now" are two
+   rupee amounts in no stated order. */
+.scroll-rows thead th { position: sticky; top: 0; z-index: 2; }
+
+/* The confirmation time, under the time the price actually moved. Smaller and
+   on its own line: it is context for the number above it, not a second
+   number to read. */
+.when-sub {
+  display: block;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* -- tiles ----------------------------------------------------------- */
+.tiles {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--s3); margin-bottom: var(--s5);
+}
+.tile {
+  position: relative; overflow: hidden;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--s4) var(--s5); min-height: 88px;
+  display: flex; flex-direction: column; gap: 2px; justify-content: center;
+  transition: box-shadow .15s ease, transform .15s ease, border-color .15s ease;
+}
+/* A cap rather than a full flood: the number stays on white where it reads
+   fastest, and the colour still tells the tiles apart down a row. */
+.tile::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 4px;
+  background: var(--tile-accent);
+}
+/* Neighbouring tiles differ without a template having to name a colour. */
+.tiles .tile:nth-child(3n+2) { --tile-accent: linear-gradient(90deg, var(--brand-3), #63c5b5); }
+.tiles .tile:nth-child(3n+3) { --tile-accent: linear-gradient(90deg, var(--brand-2), #2fae9b); }
+
+.tile-value { font-size: 28px; font-weight: 650; letter-spacing: -.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.tile-label { font-size: 12px; color: var(--muted); font-weight: 500; }
+a.tile { color: inherit; }
+a.tile:hover { text-decoration: none; border-color: var(--accent); box-shadow: var(--shadow-lg); transform: translateY(-2px); }
+
+/* The three states that mean something override the decorative ramp, so a
+   tile that is shouting never looks like one that is merely third in the row. */
+.tile-alarm {
+  border-color: #f5c2c7; background: linear-gradient(180deg, #fff5f5, var(--panel));
+  --tile-accent: linear-gradient(90deg, var(--up), var(--up-2));
+}
+.tile-alarm .tile-value { color: var(--up); }
+.tile-warn {
+  border-color: #f0d9a8; background: linear-gradient(180deg, var(--warn-bg), var(--panel));
+  --tile-accent: linear-gradient(90deg, var(--warn), var(--warn-2));
+}
+.tile-warn .tile-value { color: var(--warn); }
+.tile-quiet {
+  border-color: #a7e5cb; background: linear-gradient(180deg, #f0fdf7, var(--panel));
+  --tile-accent: linear-gradient(90deg, var(--down), var(--down-2));
+}
+.tile-quiet .tile-value { color: var(--down); }
+
+/* -- pills, badges, chips -------------------------------------------- */
+/* Every pill carries its own word, so its colour is reinforcement. The thin
+   border is what keeps it legible when it lands on a tinted row. */
+.pill {
+  display: inline-block; padding: 2px 9px; border-radius: 999px;
+  font-size: 11px; font-weight: 650; line-height: 1.5; white-space: nowrap;
+  border: 1px solid transparent;
+}
+.pill-ok      { background: #d1fae5; color: #065f46; border-color: #a7e5cb; }
+.pill-warn    { background: #fef3c7; color: #92400e; border-color: #f5d98a; }
+.pill-stop    { background: #ffe4e6; color: #9f1239; border-color: #fbc4cb; }
+.pill-off     { background: #eeeae0; color: #4a544f; border-color: #ded9cb; }
+.pill-own     { background: #dcedf7; color: #1a5a7a; border-color: #bcd9e8; }
+.pill-soldout { background: #eeeae0; color: #626f69; border-color: #ded9cb; }
+.pill-pending { background: #e0f2ee; color: #0b5f55; border-color: #bfe4dc; }
+
+.chips { display: flex; gap: var(--s2); flex-wrap: wrap; margin-bottom: var(--s3); }
+.chip {
+  background: var(--panel); border: 1px solid #ded9cb; border-radius: 999px;
+  padding: 4px 12px; font-size: 12px; box-shadow: var(--shadow); color: var(--ink-2);
+}
+
+/* A chip that is a link is a control, so it has to look pressable and it has
+   to show which one is pressed. The chosen one inverts rather than merely
+   tinting: on a page whose rows are already tinted by ownership, a pale
+   highlight is not reliably the loudest thing on screen. */
+.chips-filter { align-items: center; }
+.chips-label {
+  font-size: 11px; font-weight: 650; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--muted); margin-right: 2px;
+}
+a.chip { text-decoration: none; }
+a.chip:hover { border-color: var(--accent-2); color: var(--ink); }
+a.chip.is-on {
+  background: var(--ink); border-color: var(--ink); color: #fff; font-weight: 600;
+}
+.chip-count {
+  display: inline-block; margin-left: 6px; padding: 0 5px; min-width: 16px;
+  border-radius: 999px; background: var(--line-soft); color: var(--muted);
+  font-size: 11px; font-variant-numeric: tabular-nums; text-align: center;
+}
+a.chip.is-on .chip-count { background: rgba(255, 255, 255, .22); color: #fff; }
+
+.matrix-actions { margin-bottom: var(--s3); }
+.btn-export {
+  display: inline-block; padding: 6px 16px; border-radius: 6px;
+  background: var(--accent); color: #fff; font-size: 13px; font-weight: 600;
+  text-decoration: none; box-shadow: var(--shadow);
+}
+.btn-export:hover { background: var(--accent-2); color: #fff; }
+
+/* price history table */
+.hist-actions { margin-bottom: var(--s3); }
+.hist-table .hist-hotel { font-weight: 600; vertical-align: top; border-right: 2px solid var(--line); }
+.hist-hotel-name { display: block; font-weight: 650; }
+.hist-hotel-hd  { min-width: 160px; }
+.hist-plan-hd   { min-width: 80px; font-size: 11px; }
+.hist-date-hd   { min-width: 90px; white-space: nowrap; }
+.hist-room { font-weight: 500; }
+.hist-plan { font-size: 12px; white-space: nowrap; }
+.hist-cell {
+  padding: 6px 8px; vertical-align: top; min-width: 90px;
+  font-size: 12px; white-space: nowrap; text-align: right;
+}
+.hist-cell.hist-empty { color: var(--muted); text-align: center; }
+.hist-cell.hist-soldout { background: #fff5f5; }
+.hist-price { display: block; font-weight: 650; font-size: 13px; }
+.hist-price-out { color: var(--muted); font-weight: 400; font-size: 12px; }
+.hist-note { display: block; font-size: 11px; color: var(--muted); }
+.hist-dash { color: var(--muted); }
+
+/* Present only when non-zero, so its presence is the signal and it can afford
+   to be loud. Red text on the gradient bar is unreadable, so up there it
+   becomes a solid chip instead. */
+.topbar nav a.nav-alert { background: #e11d48; color: #fff; font-weight: 650; }
+.topbar nav a.nav-alert:hover { background: #be123c; color: #fff; }
+.topbar nav a.nav-alert.active { background: #fff; color: #be123c; }
+.nav-count {
+  display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 2px;
+  border-radius: 999px; background: #fff; color: #be123c;
+  font-size: 11px; font-weight: 700; text-align: center;
+}
+.topbar nav a.nav-alert.active .nav-count { background: #be123c; color: #fff; }
+
+/* -- the hotels table ------------------------------------------------
+ *
+ * A table with no width hints is laid out by its CONTENT, and content is a
+ * poor guide to importance here. Addresses run to sixty characters and hotel
+ * names to twenty, so the browser handed the address column most of the table
+ * and squeezed "Cloud Residency Yercaud" into three wrapped lines -- the name
+ * being both the identifier and the link, and the address being the thing
+ * nobody scans for.
+ *
+ * The name column is therefore given a floor and the address a ceiling. Both
+ * are limits rather than fixed widths, so the layout still adapts: a page of
+ * short names does not leave a gap, and a narrow window still gets a table
+ * that fits. min-width on the name is what stops it wrapping mid-phrase;
+ * max-width on the address is what leaves the room for it.
+ */
+/*
+ * table-layout: fixed, so the shares below are OBEYED rather than suggested.
+ *
+ * Automatic layout sizes a column by its widest cell, and one row here holds a
+ * 150-character booking URL where an address should be. That single row
+ * claimed seventy per cent of the table for the location column and left a
+ * band of white running the full height of the page -- every other row's
+ * address ending a third of the way across it. The lanes were already declared
+ * and the browser was entitled to ignore them.
+ *
+ * Fixed layout reads the widths from the first row and nothing else, so no
+ * single value can distort the table. The cost is that content must be made to
+ * fit its lane, which is what the two rules under it do.
+ */
+.grid-hotels { table-layout: fixed; }
+.grid-hotels .col-name { width: 22%; }
+.grid-hotels .col-location { width: 42%; }
+.grid-hotels .col-targets { width: 9%; }
+.grid-hotels .col-status { width: 11%; }
+.grid-hotels .col-actions { width: 16%; }
+/* A URL has no spaces to break at, so it would otherwise run straight out of
+   its cell and across the columns beside it. */
+.grid-hotels .hotel-location { overflow-wrap: anywhere; }
+/* The name column is sized to hold a hotel name on one line, which is why it
+   gets the second-largest share. It is NOT held there by white-space: nowrap
+   -- under fixed layout an over-long name would then run across the address
+   beside it, and a name that has to wrap is better than one that collides. */
+
+/* Every row's cells start on the same line as its name, which is the row's
+   subject. The default `top` did that only while all cells were one line
+   tall. */
+.grid-hotels td { vertical-align: middle; }
+
+/* -- the recipients table --------------------------------------------
+ *
+ * Same failure as the hotels table, from the other direction: "hotels
+ * covered" holds every hotel a person watches, so one recipient on eight
+ * hotels wrote a 130-character line that automatic layout was obliged to
+ * honour. The table grew past the window and took Status and the test
+ * buttons off the right-hand edge of the page.
+ *
+ * The count is the answer to "does this person receive anything at all",
+ * which is what the column is for; the names are a reminder, and the full
+ * list is one click away in the row's own panel. So the lane is declared,
+ * fixed layout makes it stick, and the names are clipped to it.
+ */
+.grid-recipients { table-layout: fixed; }
+/* Fixed layout computes a table's min-content width from the declared lanes
+   and not from what is in them, so .scroll-x's min-content had nothing to
+   push against: below about a thousand pixels the lanes kept their shares and
+   the one-line cells inside them -- a quiet-hours window, a timestamp -- ran
+   over their neighbours instead. A floor in pixels is what those cells
+   actually need; under it the box scrolls, which is what it is for. */
+.scroll-x > .grid-recipients { min-width: 1060px; }
+.grid-recipients .col-name { width: 15%; }
+.grid-recipients .col-reach { width: 19%; }
+.grid-recipients .col-quiet { width: 14%; }
+.grid-recipients .col-covered { width: 27%; }
+.grid-recipients .col-status { width: 8%; }
+.grid-recipients .col-actions { width: 17%; }
+/* The lane is narrower than the truncate default on every window this page is
+   read on; 100% keeps the ellipsis at the edge of the cell rather than at
+   460px inside a wider one. */
+.grid-recipients .covered-names { max-width: 100%; }
+
+/* The delivery history, same treatment. Detail holds an alert subject or a
+   provider's error text -- both long, neither worth a third of the table. */
+.grid-history { table-layout: fixed; }
+.scroll-x > .grid-history { min-width: 1040px; }
+.grid-history .col-when { width: 11%; }
+.grid-history .col-to { width: 10%; }
+.grid-history .col-hotel { width: 15%; }
+.grid-history .col-channel { width: 9%; }
+.grid-history .col-status { width: 12%; }
+.grid-history .col-detail { width: 36%; }
+.grid-history .col-actions { width: 7%; }
+/* max-width is ignored on a cell under fixed layout, so the clip has to come
+   from the lane; the cell's own overflow is what draws the ellipsis. */
+.grid-history .truncate { max-width: none; }
+
+/* -- matrix cells ---------------------------------------------------- */
+.cells { display: flex; gap: var(--s2); flex-wrap: wrap; }
+.cell {
+  display: inline-flex; flex-direction: column; gap: 1px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 6px 10px; background: #fff; min-width: 118px;
+}
+.cell-room  { font-size: 11px; color: var(--muted); }
+.cell-price { font-weight: 650; font-variant-numeric: tabular-nums; }
+.cell-changed { border-color: var(--accent); background: var(--accent-bg); box-shadow: inset 0 -2px 0 var(--accent-2); }
+.cell-soldout { background: var(--line-soft); color: var(--muted); }
+/* The rolled night, beside the sold-out cell rather than under it: the roll is
+   the answer to "then where are this hotel's prices", and an answer belongs
+   next to the question. */
+.onward { align-self: center; font-size: 12px; color: var(--muted); text-decoration: none; }
+.onward:hover { color: var(--accent); text-decoration: underline; }
+/* The basis marker, on the cells that disagree with the rest of the column.
+   Small and quiet: it qualifies a number rather than competing with it. */
+.cell-basis { font-size: 10px; color: var(--muted); font-style: italic; }
+/* The last rate under a sold-out room. Muted and small so it reads as history
+   rather than as an offer -- it sits below the words "sold out", never where
+   a bookable price would be. No strike-through: that would mean "was this,
+   now less", and this room is not for sale at any figure. */
+.cell-was { font-size: 11px; color: var(--muted); }
+
+/* -- matrix by price band -------------------------------------------- */
+/* Hotel name pinned while the bands scroll sideways: with twenty columns the
+   row would otherwise lose the one thing that says whose rooms these are. */
+.matrix-bands .band-hotel {
+  position: sticky; left: 0; z-index: 1; background: var(--panel);
+  min-width: 170px; border-right: 1px solid var(--line);
+}
+.matrix-bands thead .band-hotel { z-index: 2; }
+.matrix-bands .own-property .band-hotel { background: var(--accent-bg); }
+.matrix-bands .band-head { white-space: nowrap; text-align: left; }
+.matrix-bands .band-cell { min-width: 118px; padding: 8px 6px; border-left: 1px solid var(--line-soft); }
+.band-room {
+  display: flex; flex-direction: column; gap: 1px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 5px 8px; background: #fff;
+}
+.band-room:last-child { margin-bottom: 0; }
+
+/* -- comparison grid --------------------------------------------------
+ *
+ * One column per room category, one row per property, and in each cell the
+ * gap between their entry price for the tier and ours. Three lines of
+ * different weight, in the order they are read: the price, the room it
+ * belongs to, and the gap.
+ *
+ * The gap is the loud line even though it is not the biggest number, because
+ * it is the only one on the page that cannot be read off the Matrix. The
+ * price above it is what the gap is made of, so it stays plain.
+ */
+.grid-gap td { vertical-align: top; }
+/* Every price in this table is compared against the one above it, so the whole
+   grid is tabular figures. The columns are narrow and the eye travels down
+   them; proportional digits make that measurably slower. */
+.grid-gap td, .grid-gap th { font-variant-numeric: tabular-nums; }
+/* Wide enough for a gap pill to stay on one line.
+ *
+ * At 132px the narrow columns cut every pill in two, so the same reading
+ * looked like a one-line answer under Suite and a two-line one under Classic
+ * Room. The table is width:100%, so raising the floor costs no total width --
+ * it moves slack out of the columns that had it into the ones that did not.
+ *
+ * Not load-bearing: a longer number than today's (a six-figure rate) wraps
+ * between the amount and the percentage and still reads correctly. This only
+ * buys the common case a straight line. */
+.grid-gap tbody td:not(:first-child) { min-width: 192px; }
+/* The property column needs a floor of its own, or the rule above takes its
+   width: raising six columns at once left the first one narrow enough to
+   break "HCG MURMURING MEADOWS" across two lines and push the "yours" chip
+   below the name it belongs to. This is the column every row is found by. */
+.grid-gap thead th:first-child,
+.grid-gap tbody td:first-child { min-width: 250px; }
+/* ONE ROOM: PRICE, NAME, POSITION -- ALWAYS THOSE THREE, ALWAYS IN THAT ORDER
+ *
+ * A grid rather than flowed spans. Flowed, a pill rides up beside a one-line
+ * room name in one column and drops below a three-line one in the next, so
+ * two identical kinds of answer land at two different heights and the eye
+ * reads them as different kinds of thing. On a grid every block is the same
+ * three rows in the same order, whatever the name does.
+ *
+ * Rows stay full width so long room names wrap instead of overflowing the
+ * column; only the pills are pulled back to their own width, below.
+ */
+.gap-rate { display: grid; row-gap: 2px; }
+/* The further rooms of the tier are peers of the first, not parts of it, so
+   they are separated by a hairline rather than indented under it -- an indent
+   would suggest the second figure was somehow inside the first. Drawn on the
+   adjacency, so a cell with one room has no stray rule under it. */
+.gap-rate + .gap-rate {
+  margin-top: 9px; padding-top: 9px; border-top: 1px dashed var(--line);
+}
+.gap-price { display: block; font-weight: 650; }
+.gap-room  { display: block; font-size: 11px; color: var(--muted); }
+/* Subordinate in weight only. The entry price is the figure a rate decision
+   is made against so it stays the heaviest thing in the cell, but the rest
+   are not shrunk: the pill under them is already 11px, and going below that
+   costs the word inside it as well as the colour. */
+.gap-rate + .gap-rate .gap-price { font-weight: 550; opacity: .92; }
+/* Pills are grid items, and a grid item fills its column by default -- which
+   would stretch a "cheaper" pill the full width of the cell and turn a tight
+   chip into a banner. Pulled back to their own width, left-aligned with the
+   price above them. */
+.gap-rate > .gap-delta,
+.gap-rate > .gap-level,
+.gap-rate > .gap-base { justify-self: start; margin-top: 3px; }
+/* The gap, on its own line under the price it is measured from. A pill rather
+   than coloured text: at 11px, colour alone on a thin glyph is the weakest
+   possible signal, and the tint gives the word behind it something to sit on.
+ *
+ * WHICH COLOUR MEANS WHAT, AND WHY IT IS NOT THE SAME AS ON CHANGES
+ * =================================================================
+ * On Changes, red is a price going up. Here, red is a competitor sitting
+ * BELOW us -- the one fact on this page that costs money, and the one worth
+ * the loudest colour on it. Green is a competitor above us.
+ *
+ * That is a genuine reversal between two screens, so neither colour is ever
+ * asked to carry the meaning by itself: every pill also says "cheaper" or
+ * "dearer" in words, and the legend under the table says which is which.
+ */
+.gap-delta {
+  display: inline-flex; align-items: baseline; gap: 2px 5px; margin-top: 5px;
+  font-size: 11px; font-weight: 650; border-radius: 999px;
+  padding: 2px 8px; border: 1px solid transparent;
+  /* Wraps as a whole, between the amount and the percentage, and never inside
+     the amount -- so a column too narrow for one line gives
+     "−₹1,956.00 cheaper" over "38.1%" rather than splitting the direction off
+     the number it describes. */
+  flex-wrap: wrap;
+}
+.gap-amt { white-space: nowrap; }
+.gap-under { color: var(--up);   background: var(--up-bg);   border-color: #f3c9c9; }
+.gap-over  { color: var(--down); background: var(--down-bg); border-color: #bfe4d3; }
+/* Level is a real answer and not a missing one, so it gets a pill too --
+   quiet, because matching the market exactly needs no action. */
+.gap-level {
+  display: inline-block; margin-top: 5px; font-size: 11px; font-weight: 650;
+  color: var(--muted); background: var(--line-soft);
+  border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px;
+}
+.gap-pct { font-weight: 600; opacity: .78; }
+/* A gap between a pre-tax price and an all-in one. Dashed rather than solid:
+   the number is approximate and the border is the only part of the pill that
+   can say so without adding a fourth line to a cell that has three. */
+.gap-approx { border-style: dashed; }
+.gap-flag { font-weight: 700; }
+/* "your rate" on the baseline row. It replaces the gap line, so the row keeps
+   the same height as every row measured from it. */
+.gap-base { display: block; margin-top: 5px; font-size: 11px; color: var(--accent); font-weight: 600; }
+.gap-none { color: var(--muted); }
+/* The row summed up, under the property name: the scan down the first column
+   before anybody reads a single cell. */
+.gap-summary { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+.legend-under { background: var(--up-bg);   border: 1px solid var(--up-2); }
+.legend-over  { background: var(--down-bg); border: 1px solid var(--down-2); }
+
+/* -- forms ----------------------------------------------------------- */
+.filters {
+  position: relative; overflow: hidden;
+  display: flex; gap: var(--s4); align-items: flex-end; flex-wrap: wrap;
+  background: linear-gradient(180deg, #faf8f2, var(--panel));
+  border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--s4); margin-bottom: var(--s4);
+}
+.filters::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+  background: var(--grad-brand); opacity: .85;
+}
+.filters label, .stack label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px; font-weight: 500; color: var(--muted);
+}
+.filters label.inline, .stack label.inline { flex-direction: row; align-items: center; gap: 6px; }
+.stack { display: flex; flex-direction: column; gap: var(--s3); max-width: 460px; }
+
+input, select, textarea {
+  font: inherit; padding: 7px 10px;
+  border: 1px solid #dcd7c9; border-radius: var(--radius-sm);
+  background: #fff; color: var(--ink);
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+input:hover, select:hover, textarea:hover { border-color: #c2bcaa; }
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(11,114,103,.20);
+}
+input::placeholder, textarea::placeholder { color: #9aa29d; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); }
+
+button {
+  font: inherit; font-weight: 600; padding: 7px 14px;
+  border: 1px solid transparent; border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--brand-1), var(--accent-2));
+  color: #fff; cursor: pointer; white-space: nowrap;
+  box-shadow: var(--shadow-brand);
+  transition: filter .12s ease, opacity .12s ease, box-shadow .12s ease, transform .08s ease;
+}
+button:hover { filter: brightness(1.08); box-shadow: 0 3px 10px rgba(11,114,103,.30); }
+button:active { filter: brightness(.95); transform: translateY(1px); }
+button:disabled { opacity: .45; cursor: default; filter: none; box-shadow: none; }
+
+/* Row actions in dense tables should not shout. A table with a gradient
+   button on every line reads as a toolbar rather than as a list. */
+.grid button {
+  padding: 4px 10px; font-size: 12px;
+  background: var(--panel); color: var(--ink-2);
+  border-color: #ded9cb; box-shadow: none;
+}
+.grid button:hover {
+  background: var(--accent-bg); border-color: var(--accent); color: var(--accent);
+  filter: none; box-shadow: none;
+}
+
+.btn-link {
+  display: inline-block; padding: 7px 14px;
+  border: 1px solid #ded9cb; border-radius: var(--radius-sm);
+  background: var(--panel); font-weight: 600; box-shadow: var(--shadow);
+  transition: border-color .12s ease, box-shadow .12s ease, transform .1s ease;
+}
+.btn-link:hover {
+  border-color: var(--accent); color: var(--accent); text-decoration: none;
+  box-shadow: var(--shadow-lg); transform: translateY(-1px);
+}
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-left: 3px solid #ded9cb;
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--s3) var(--s4); margin: var(--s3) 0;
+  transition: border-left-color .15s ease;
+}
+/* The open one is the one being worked in, so it is the one that lights up. */
+.panel[open] { border-left-color: var(--accent); }
+.panel summary {
+  cursor: pointer; font-weight: 600; list-style: none;
+  display: flex; align-items: center; gap: var(--s2); padding: 2px 0;
+}
+.panel summary::-webkit-details-marker { display: none; }
+.panel summary::before {
+  content: "\203A"; color: var(--accent); font-size: 16px; line-height: 1;
+  display: inline-block; transition: transform .15s ease;
+}
+.panel[open] summary::before { transform: rotate(90deg); }
+.panel[open] summary { margin-bottom: var(--s3); }
+.panel > form { margin-top: var(--s3); }
+
+form.inline { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
+.form-status { font-size: 12px; margin: 0; }
+.form-status.ok { color: var(--down); }
+.form-status.error, .error { color: var(--up); }
+.run-status { margin-left: var(--s2); font-size: 12px; }
+
+/* -- guided setup ----------------------------------------------------
+   Shown only while a hotel has no prices. Once it is collecting, the
+   scaffolding disappears rather than becoming permanent clutter. */
+.setup {
+  position: relative; overflow: hidden;
+  background: linear-gradient(180deg, #faf8f2, var(--panel));
+  border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--s5); padding-left: calc(var(--s5) + 3px);
+  margin-bottom: var(--s5);
+}
+.setup::before {
+  content: ""; position: absolute; inset: 0 auto 0 0; width: 3px;
+  background: var(--grad-brand);
+}
+.setup-title { margin: 0 0 var(--s4); font-size: 15px; }
+.steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s4); }
+/* Unreachable steps are dimmed, never hidden: the length of the path stays honest. */
+.steps li { display: flex; gap: var(--s3); align-items: flex-start; opacity: .42; transition: opacity .2s ease; }
+.steps li.now, .steps li.done { opacity: 1; }
+.step-n {
+  flex: 0 0 26px; height: 26px; border-radius: 50%;
+  background: var(--line-soft); color: var(--muted);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700;
+}
+/* The step you are on gets the ramp and a halo; done steps go green. */
+.steps li.now .step-n {
+  background: linear-gradient(135deg, var(--brand-1), var(--accent-2)); color: #fff;
+  box-shadow: 0 0 0 4px rgba(11,114,103,.16);
+}
+.steps li.done .step-n { background: #d1fae5; color: #065f46; }
+.step-body { flex: 1; display: flex; flex-direction: column; gap: var(--s2); min-width: 0; }
+.step-body > strong { font-size: 14px; }
+.step-body > .muted { font-size: 12px; line-height: 1.5; max-width: 640px; }
+.step-body .stack { max-width: 640px; gap: var(--s2); }
+.step-body input[name="url"] {
+  width: 100%; font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.step-body label.tight { flex-direction: row; align-items: center; gap: 6px; white-space: nowrap; }
+.step-body label.tight input { width: 74px; }
+
+/* -- login ----------------------------------------------------------- */
+/* The only full-bleed colour in the product. Nothing is being compared on
+   this screen, so the page is allowed to just be the brand -- and the brand
+   is the bar colour, which is the first thing anyone sees after signing in. */
+.login-body {
+  display: flex; align-items: center; justify-content: center;
+  min-height: 100vh; padding: var(--s5);
+  background:
+    radial-gradient(700px 420px at 12% 8%, rgba(255,255,255,.45), transparent 60%),
+    linear-gradient(150deg, var(--bar), #5cc4b3);
+  color: var(--bar-ink);
+}
+.login-card {
+  position: relative; overflow: hidden;
+  background: var(--panel); border: 1px solid rgba(255,255,255,.7);
+  border-radius: 16px; box-shadow: 0 18px 50px -12px rgba(10,58,52,.35);
+  padding: var(--s6); width: 100%; max-width: 380px;
+  display: flex; flex-direction: column; gap: var(--s2);
+}
+.login-card::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 4px;
+  background: var(--grad-brand);
+}
+.login-card h1 { font-size: 20px; margin: 0; }
+.login-card p { margin: 0 0 var(--s3); }
+.login-card label { font-size: 12px; font-weight: 500; color: var(--muted); margin-top: var(--s2); }
+.login-card button { margin-top: var(--s4); padding: 9px 14px; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px; background: #e4f4f0; color: #0b7267;
+  padding: 1px 5px; border-radius: 4px;
+}
+
+/* -- empty states ----------------------------------------------------
+   An empty screen should explain why it is empty, not just show nothing.
+   The dashed edge says "nothing here yet" before the sentence is read. */
+.empty-state {
+  background: linear-gradient(180deg, #faf8f2, var(--panel));
+  border: 1px dashed #d9d3c4;
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: var(--s7) var(--s5); text-align: center;
+}
+.empty-big { font-size: 18px; font-weight: 650; margin: 0 0 var(--s2); }
+.empty-state .muted { max-width: 540px; margin: 0 auto; font-size: 13px; }
+
+/* -- narrow screens -------------------------------------------------- */
+@media (max-width: 720px) {
+  .topbar { height: auto; padding: var(--s2) var(--s3); flex-wrap: wrap; gap: var(--s2); }
+  .topbar nav { order: 3; width: 100%; overflow-x: auto; padding-bottom: 2px; }
+  .topbar .user { font-size: 12px; }
+  main { padding: var(--s3); }
+  h1 { font-size: 20px; }
+  .grid { font-size: 13px; }
+  .grid th, .grid td { padding: 9px var(--s3); }
+}
+
+/* -- change popups -------------------------------------------------- */
+/*
+ * Bottom-right, stacking upward, four at most. Bottom rather than top because
+ * the topbar is sticky and a toast over the nav hides the Attention count.
+ *
+ * Same colour language as the tables: red is a price going UP, green is one
+ * coming DOWN. Each toast also names its own event ("Price up", "Sold out"),
+ * so nothing here depends on telling the two apart.
+ */
+.toast-stack {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(340px, calc(100vw - 32px));
+  pointer-events: none;   /* the page underneath stays clickable */
+}
+
+.toast {
+  pointer-events: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--muted);
+  border-radius: 10px;
+  padding: 10px 12px;
+  box-shadow: 0 8px 24px rgba(10,58,52,.16);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  animation: toast-in .18s ease-out;
+}
+/* The wash fades out well before the text starts, so the words keep full
+   contrast and only the edge is coloured. */
+.toast-up    { border-left-color: var(--up-2);   background: linear-gradient(90deg, #fff6f7, var(--panel) 55%); }
+.toast-down  { border-left-color: var(--down-2); background: linear-gradient(90deg, #f2fdf8, var(--panel) 55%); }
+.toast-gone  { border-left-color: var(--muted);  background: linear-gradient(90deg, #f7f7fa, var(--panel) 55%); }
+.toast-back  { border-left-color: var(--accent); background: linear-gradient(90deg, #eefaf7, var(--panel) 55%); }
+.toast-more  { border-left-color: var(--warn-2); background: linear-gradient(90deg, #fffaef, var(--panel) 55%); }
+
+.toast-head { display: flex; align-items: center; gap: 8px; }
+.toast-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.toast-up   .toast-label { color: var(--up); }
+.toast-down .toast-label { color: var(--down); }
+.toast-gone .toast-label { color: var(--muted); }
+.toast-back .toast-label { color: var(--accent); }
+.toast-more .toast-label { color: var(--warn); }
+
+.toast-close {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  color: var(--muted);
+  font-size: 17px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+}
+.toast-close:hover { color: var(--ink); background: none; filter: none; box-shadow: none; }
+
+.toast-hotel { font-weight: 600; }
+.toast-room  { color: var(--muted); font-size: 12px; }
+.toast-basis { color: var(--muted); font-size: 11px; font-style: italic; }
+.toast-prices { font-size: 15px; margin-top: 2px; }
+.toast-was   { color: var(--muted); }
+.toast-delta { margin-left: 6px; font-size: 12px; font-weight: 600; }
+.toast-up   .toast-delta { color: var(--up); }
+.toast-down .toast-delta { color: var(--down); }
+.toast-when { color: var(--muted); font-size: 11px; }
+
+.toast-leaving { opacity: 0; transform: translateX(12px); transition: opacity .2s, transform .2s; }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+/* Someone who has asked for less motion still gets the toast and the colour,
+   just without anything sliding or lifting. */
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
+  .toast-leaving { transition: none; }
+  .tile, .btn-link, button { transition: none; }
+  a.tile:hover, .btn-link:hover, button:active { transform: none; }
+}
+
+/* -- error detail rows ---------------------------------------------- */
+/*
+ * The message cell is a button so the whole line is a target, not a small
+ * "details" link at the end of it. It still looks like text: a table of
+ * buttons reads as a toolbar. It therefore has to undo the gradient the
+ * base button rule gives it.
+ */
+.grid .error-expand, .error-expand {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  box-shadow: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.grid .error-expand:hover, .error-expand:hover {
+  color: var(--accent); background: none; border-color: transparent;
+  filter: none; box-shadow: none;
+}
+.error-expand .error-caret {
+  color: var(--accent);
+  font-size: 10px;
+  transition: transform .15s ease;
+}
+.error-expand.is-open .error-caret { transform: rotate(90deg); }
+.error-expand.is-open .truncate { white-space: normal; overflow: visible; }
+
+.error-detail > td { background: #fdf6f7; padding: 0; }
+.error-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  padding: var(--s4);
+  border-left: 3px solid var(--up-2);
+}
+
+.error-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2) var(--s5);
+  margin: 0;
+}
+.error-meta dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+.error-meta dd { margin: 2px 0 0; }
+
+/* Messages and context are wrapped, not scrolled sideways: a stack trace in a
+   horizontally scrolling box is read as one line and the rest is missed. */
+.error-panel pre {
+  margin: 0;
+  padding: var(--s3);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font: 12px/1.55 ui-monospace, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.error-message { color: var(--up); }
+.error-block h3 {
+  margin: 0 0 var(--s2);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--muted);
+}
+
+.error-shot { margin: 0; }
+.error-shot-frame {
+  max-height: 380px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.error-shot img { display: block; width: 100%; }
+.error-shot figcaption { margin-top: var(--s2); font-size: 12px; }
+
+/* -- expandable recipient rows --------------------------------------- */
+/* The same disclosure as the error rows, in the page's own colours rather
+   than the red an error earns. Nothing here is a failure. */
+.grid .row-expand, .row-expand {
+  display: flex; align-items: center; gap: var(--s2);
+  padding: 0; border: 0; background: none; box-shadow: none;
+  color: inherit; font: inherit; text-align: left; cursor: pointer;
+}
+.grid .row-expand:hover, .row-expand:hover {
+  color: var(--accent); background: none; border-color: transparent;
+  filter: none; box-shadow: none;
+}
+.row-expand .row-caret {
+  color: var(--accent); font-size: 10px; transition: transform .15s ease;
+}
+.row-expand.is-open .row-caret { transform: rotate(90deg); }
+
+.row-detail > td { background: var(--line-soft); padding: 0; }
+.row-panel { padding: var(--s4); border-left: 3px solid var(--accent); }
+/* Two columns where there is room -- who they cover on the left, who they
+   are on the right -- and stacked on a laptop rather than squeezed. */
+.row-panel-cols {
+  display: grid; gap: var(--s5);
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+.row-panel h3 {
+  margin: 0 0 var(--s3);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted);
+}
+.row-panel .stack { max-width: none; margin-top: var(--s4); }
+.row-panel .filters { margin-bottom: 0; padding: var(--s3); }
+
+/* .stack is 460px wide because a stack is normally a column of form fields,
+   and a form field wider than that is harder to read, not easier. The stored
+   history panel is a stack of a TABLE, and squeezed into a form's width its
+   two-word row labels wrapped onto two lines each while three quarters of the
+   section sat empty beside them. */
+#stored-history { max-width: none; }
+#stored-history .grid { margin-bottom: 0; }
+
+/* The prose in the displayed-prices panel keeps a reading measure of its own.
+   The panel is full column width (see .setup-col below); left to run the whole
+   of it on a wide screen these paragraphs would set a 180-character line,
+   which is harder to read than the narrow column they replaced. */
+#price-display > span,
+#price-display > p { max-width: 92ch; }
+
+/* The market-summary interval, for the same reason and then one more: it is
+   not in a .setup-pair column, so the 460px cap left it as a narrow strip down
+   the left of a section the full width of the page -- three quarters empty
+   beside a dozen short lines of prose.
+
+   The prose still keeps a reading measure of its own. Full width on a wide
+   screen would be a 180-character line, which is harder to read than the
+   narrow column was, so removing the cap and setting no measure would have
+   traded one layout problem for a worse one. */
+#summary-interval { max-width: none; }
+
+/* The notes under the box explain one setting from three angles -- what zero
+   means, what a quiet window does, and when the message arrives -- so they sit
+   beside each other rather than one under the other. It also fills a section
+   that a single column of prose left three quarters empty.
+ *
+ * Two columns rather than auto-fit, because auto-fit at this width would give
+ * four columns of about forty characters -- the narrow-column problem again,
+ * arrived at from the other direction. Two columns of a full-width section is
+ * roughly an 80-character measure, which is the width prose wants. */
+#summary-interval .shape-grid {
+  display: grid;
+  gap: var(--s3) var(--s5);
+  align-items: start;
+}
+@media (min-width: 1000px) {
+  #summary-interval .shape-grid { grid-template-columns: 1fr 1fr; }
+}
+
+/* -- a switch -------------------------------------------------------- */
+/*
+ * One control that IS the setting, rather than a checkbox plus a Save. It
+ * carries role="switch" and aria-checked, and the track position is the only
+ * thing on screen that states which way it is set -- so the knob has to move
+ * far enough to be read at a glance, and the off state has to look off rather
+ * than merely paler.
+ *
+ * Every rule below that looks redundant is undoing the page's own `button`
+ * style, which is a white-on-teal gradient pill with a shadow. Left in place
+ * it would paint the switch as an ordinary submit button and the track would
+ * sit inside it like a decoration.
+ */
+.switch-row { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+
+.switch {
+  display: inline-flex; align-items: center; gap: var(--s3);
+  padding: 0; border: 0;
+  background: none; box-shadow: none;
+  color: var(--ink); font-weight: 600;
+  white-space: normal;
+}
+.switch:hover { filter: none; box-shadow: none; }
+.switch:active { transform: none; filter: none; }
+.switch:focus-visible { outline: 2px solid var(--brand-2); outline-offset: 3px; border-radius: var(--radius-sm); }
+
+.switch-track {
+  position: relative; flex: 0 0 auto;
+  width: 42px; height: 24px; border-radius: 999px;
+  background: #cfd6d2;
+  border: 1px solid #b9c2bd;
+  transition: background .16s ease, border-color .16s ease;
+}
+.switch-knob {
+  position: absolute; top: 2px; left: 2px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(22,33,30,.35);
+  transition: transform .16s ease;
+}
+.switch[aria-checked="true"] .switch-track {
+  background: var(--brand-2);
+  border-color: var(--brand-1);
+}
+.switch[aria-checked="true"] .switch-knob { transform: translateX(18px); }
+
+/* Dimmed while the save is in flight, so a second click on a switch that has
+   already been pressed is visibly not doing anything. */
+.switch:disabled { opacity: .55; cursor: default; }
+.switch:disabled .switch-track { transition: none; }
+
+.switch-text { font-size: 14px; }
+
+/* An expanded row is a FORM, not a row of table actions.
+ *
+ * .grid button deliberately mutes every button inside a table -- a gradient on
+ * every line reads as a toolbar. The recipient panel is inside a table too, by
+ * construction: it is a <tr> holding a form. So Save came out the same weight
+ * as Remove, and the panel had no primary at all -- three ghost buttons and a
+ * red one, with nothing saying which finished the job.
+ *
+ * Only what submits. Remove, Test and Deactivate carry no type attribute and
+ * so do not match, which is what keeps the dense row actions quiet. */
+.row-panel form button[type="submit"] {
+  background: linear-gradient(135deg, var(--brand-1), var(--accent-2));
+  color: #fff; border-color: transparent; box-shadow: var(--shadow-brand);
+  padding: 7px 14px; font-size: 14px;
+}
+.row-panel form button[type="submit"]:hover {
+  background: linear-gradient(135deg, var(--brand-1), var(--accent-2));
+  color: #fff; filter: brightness(1.08);
+  box-shadow: 0 3px 10px rgba(11,114,103,.30);
+}
+
+/* A table inside a table needs to read as the smaller thing. */
+.subgrid { font-size: 12px; margin-bottom: 0; }
+.subgrid th { font-size: 10px; }
+
+.channel-set {
+  display: flex; align-items: center; gap: var(--s4); flex-wrap: wrap;
+  margin: 0; padding: var(--s3) var(--s4);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.channel-set legend {
+  padding: 0 var(--s2);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted);
+}
+/* Left unstyled outside .step-body, so a "quiet from / until" pair stacked
+   into two columns of one input each. */
+.filters label.tight, .stack label.tight {
+  flex-direction: row; align-items: center; gap: 6px; white-space: nowrap;
+}
+/* The width is for the CONTROL a tight label is built around -- a number, a
+   time, a short code. A checkbox is not that: given 96px it keeps drawing at
+   13px and pads the other 83, which put the Channels fieldset's boxes three
+   quarters of an inch from the words they tick. The box sizes itself. */
+.filters label.tight input:not([type="checkbox"]):not([type="radio"]),
+.stack label.tight input:not([type="checkbox"]):not([type="radio"]) { width: 96px; }
+
+select[multiple] { padding: 4px; min-height: 120px; }
+
+/* -- destructive actions -------------------------------------------- */
+/*
+ * Set apart from the form above it rather than sitting in the same flow. The
+ * two actions in here are the only ones on the page that lose something, and
+ * one of them cannot be undone at all. This is the one place where a hot
+ * colour is the point rather than decoration.
+ */
+.danger-zone {
+  margin-top: var(--s5);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+}
+.danger-zone h3 {
+  margin: 0 0 var(--s2);
+  font-size: 13px;
+  font-weight: 600;
+}
+.danger-zone .danger-head {
+  margin-top: var(--s5);
+  color: var(--up);
+}
+.danger-zone p { margin: 0 0 var(--s3); max-width: 60ch; font-size: 13px; }
+.danger-zone .stack { max-width: 420px; }
+.danger-zone code { font-size: 12px; }
+
+button.danger {
+  background: linear-gradient(135deg, #b91c1c, var(--up-2));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(190,18,60,.30);
+}
+button.danger:hover { filter: brightness(1.08); box-shadow: 0 3px 10px rgba(190,18,60,.36); }
+
+/* Kept small and low-contrast: a table with a full-size button on every line
+   reads as a form rather than as a list. */
+.row-actions { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.row-actions button { padding: 2px 8px; font-size: 12px; }
+
+/* -- overview: hotel freshness strip ---------------------------------- */
+/*
+ * "Are these prices current?" is the third question this page claims to
+ * answer and the only one it used to leave to guesswork: a frozen hotel and a
+ * healthy one looked identical, because both had prices on screen.
+ *
+ * So the card leads with the status word, not the time. A clock reading makes
+ * the reader do the subtraction; the word has already done it.
+ */
+.hotel-strip {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: var(--s3);
+}
+.hcard {
+  display: flex; flex-direction: column; gap: var(--s2);
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow); padding: var(--s4);
+  color: inherit;
+  transition: box-shadow .15s ease, transform .15s ease, border-color .15s ease;
+}
+a.hcard:hover {
+  text-decoration: none; border-color: var(--accent);
+  box-shadow: var(--shadow-lg); transform: translateY(-2px);
+}
+.hcard-top { display: flex; align-items: flex-start; gap: var(--s2); }
+.hcard-name { font-weight: 600; line-height: 1.35; }
+.hcard-top .pill { margin-left: auto; }
+.hcard-figures { display: flex; align-items: baseline; gap: 6px; }
+.hcard-count {
+  font-size: 20px; font-weight: 650; letter-spacing: -.02em;
+  font-variant-numeric: tabular-nums;
+}
+.hcard-sub { font-size: 12px; color: var(--muted); }
+.hcard-foot {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--muted);
+  border-top: 1px solid var(--line-soft); padding-top: 9px; margin-top: auto;
+}
+/* The two unhappy states tint the whole card, because a pill alone is easy to
+   miss in a row of four and this is the row you skim rather than read. */
+.hcard-warn { border-color: #f0d9a8; background: linear-gradient(180deg, var(--warn-bg), var(--panel)); }
+.hcard-warn .hcard-foot { color: var(--warn); border-top-color: #f5e6c0; }
+.hcard-bad  { border-color: #f5c2c7; background: linear-gradient(180deg, #fff5f5, var(--panel)); }
+.hcard-bad .hcard-foot { color: var(--up); border-top-color: #f7d7da; }
+
+/* -- a fact the table cannot state ------------------------------------ */
+/*
+ * Five rows that each moved by the identical amount are five separate facts
+ * on screen and one fact in reality. The table can only show the rows.
+ */
+.note {
+  display: flex; gap: var(--s3); align-items: flex-start;
+  background: var(--accent-bg); border: 1px solid #bfe4dc;
+  border-radius: var(--radius); padding: var(--s3) var(--s4);
+  color: var(--ink-2);
+}
+.note svg { flex: 0 0 auto; margin-top: 1px; }
+.note strong { font-weight: 650; }
+
+/* -- movement bar ----------------------------------------------------- */
+/*
+ * Length is percentage change, not rupees: a 81 rupee move means something
+ * very different on a 1,000 room and a 3,600 one, and the percentage is the
+ * comparable quantity. Purely supplementary — the number is right beside it.
+ */
+.movebar { height: 7px; border-radius: 999px; background: var(--line-soft); overflow: hidden; }
+.movebar span { display: block; height: 100%; border-radius: 999px; }
+.movebar-up   span { background: linear-gradient(90deg, var(--up-2), var(--up)); }
+.movebar-down span { background: linear-gradient(90deg, var(--down-2), var(--down)); }
+
+/* -- tile subtext ----------------------------------------------------- */
+.tile-sub { font-size: 11px; font-weight: 600; margin-top: 2px; color: var(--muted); }
+.tile-alarm .tile-sub { color: var(--up); }
+.tile-quiet .tile-sub { color: var(--down); }
+.tile-warn  .tile-sub { color: var(--warn); }
+
+/* -- legend ----------------------------------------------------------- */
+/*
+ * A highlighted cell meant "changed in the last 24 hours" only to whoever
+ * wrote the template. Stated once under the grid, it means that to everyone.
+ */
+.legend {
+  display: flex; align-items: center; gap: var(--s5); flex-wrap: wrap;
+  margin-top: var(--s3); color: var(--muted); font-size: 12px;
+}
+.legend-item { display: inline-flex; align-items: center; gap: 7px; }
+.legend-swatch { width: 22px; height: 13px; border-radius: 4px; flex: 0 0 auto; }
+.legend-changed { border: 1px solid var(--accent); background: var(--accent-bg); box-shadow: inset 0 -2px 0 var(--accent-2); }
+.legend-soldout { background: var(--line-soft); border: 1px solid var(--line); }
+.legend-own { width: 3px; height: 13px; border-radius: 2px; background: var(--accent); }
+.legend-note { margin-left: auto; }
+
+/* A checkbox whose label is a sentence rather than a noun — "Tell them when
+   monitoring breaks". Inputs are full-width block elements everywhere else on
+   this page, which would put the box on its own line above its own meaning.
+
+   THE SELECTOR LIST IS THE RULE, not decoration on it. `.stack label` sets
+   flex-direction: column, which is right for a caption above its input and
+   wrong for this — and at (0,1,1) it out-specifies a bare `.checkline` at
+   (0,1,0). Every checkline on the site lives inside a .stack, so every one of
+   them rendered as a centred box floating above its own sentence: the ops
+   alert switch on Settings, the tax switch before it became a toggle, and the
+   own-property tick on the hotel page. It reads as a stray checkbox belonging
+   to the field above.
+
+   Named for both parents rather than fixed by adding `.inline` at each call
+   site, because the next one written will be `class="checkline"` like the
+   others and would arrive broken in the same way. */
+.stack label.checkline,
+.filters label.checkline,
+.checkline {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: var(--s2, 8px);
+  font-weight: 500;
+}
+.checkline input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+  flex: 0 0 auto;
+}
+
+/* WhatsApp alert numbers: phone and label side by side, stacking on narrow
+   screens so the panel stays usable on a phone -- which is where somebody
+   adding their own number is most likely to be standing. */
+.alert-number-row {
+  display: flex;
+  gap: .75rem;
+  align-items: flex-end;
+}
+/* "Number 1", not "Number" with a lonely 1 beneath it. .stack label is a flex
+   COLUMN, so the caption's text node and the row's index were two flex items
+   and took a line each -- which read as an empty field labelled with a digit.
+   Block display puts the caption back on one line and the input under it. */
+.alert-number-row label { flex: 1 1 0; margin: 0; display: block; }
+.alert-number-row label > input { display: block; width: 100%; margin-top: 4px; }
+.alert-number-row .row-number { color: var(--muted); }
+.alert-number-row .alert-number-remove {
+  flex: 0 0 auto;
+  padding: .35rem .6rem;
+  line-height: 1;
+  background: transparent;
+  border: 1px solid var(--line, #d1d5db);
+  color: var(--muted, #6b7280);
+}
+.alert-number-row .alert-number-remove:hover {
+  border-color: #b91c1c;
+  color: #b91c1c;
+}
+.alert-number-actions {
+  display: flex;
+  align-items: center;
+  gap: .75rem;
+}
+/* Adding a row commits nothing -- the numbers are saved by the button at the
+   bottom of the panel. Two brand-coloured buttons in one panel put the same
+   weight on both, so the one that only grows the form steps back. */
+.alert-number-add {
+  background: var(--panel); color: var(--ink-2);
+  border-color: #ded9cb; box-shadow: none;
+}
+.alert-number-add:hover {
+  background: var(--accent-bg); border-color: var(--accent); color: var(--accent);
+  filter: none; box-shadow: none;
+}
+.alert-number-add[disabled] { opacity: .5; cursor: not-allowed; }
+
+@media (max-width: 640px) {
+  .alert-number-row { flex-direction: column; align-items: stretch; gap: .35rem; }
+  /* Full width on its own line, rather than a stray x under the label. */
+  .alert-number-row .alert-number-remove { width: 100%; }
+}
+
+/* The two ways of adding somebody, side by side.
+   Equal columns rather than content-sized: the panels are alternatives to
+   each other, and an unequal pair reads as one being the main route and the
+   other an afterthought. They stack below 900px, where two columns would put
+   the phone fields in about 200px. */
+.setup-pair {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+.setup-pair > .setup-col {
+  flex: 1 1 0;
+  min-width: 0;          /* let the column shrink; without it the muted
+                            paragraphs set a floor and the row overflows */
+}
+/* The heading already sits under the section rule, so the usual top margin
+   would push the two columns' panels out of line with each other. */
+.setup-pair > .setup-col > h2:first-child { margin-top: 0; }
+
+@media (max-width: 900px) {
+  .setup-pair { flex-direction: column; gap: 0; }
+}
+
+/* THE COLUMN IS THE MEASURE, so everything in it is one width.
+ *
+ * .stack caps itself at 460px because a stack is normally a column of form
+ * fields loose on a page, and an input wider than that is harder to read.
+ * Inside a setup-pair column that cap is measuring the wrong thing: the
+ * column is already about 600px and already a reading measure, so the cap
+ * left every panel sitting in a column of its own width. Alert sensitivity
+ * filled its column (it had an override of its own), Email stopped 145px
+ * short of the same edge directly below it, and the two Add panels further
+ * down each left a gutter their own summary line crossed -- four panels, four
+ * right edges, in two columns that are exactly equal.
+ *
+ * Written once here rather than as another `#some-id { max-width: none }`
+ * beside the three that were already there: the next panel added to one of
+ * these columns should line up without anybody remembering to say so.
+ */
+.setup-col > .panel,
+.setup-col > .panel > .stack,
+.setup-col > form.panel { max-width: none; }
+
+/* A submit button is a button, not a banner. In a capped stack the two look
+   the same -- 460px is about what a wide button wants anyway -- but these
+   stacks are uncapped, so Save in a recipient's panel drew a 620px bar
+   directly above a Deactivate the size of its own word. Everything that saves
+   on this page is now the size of what it says. */
+.setup-col .stack > button,
+.row-panel .stack > button { align-self: flex-start; }
+
+
+/* -- alert sensitivity ------------------------------------------------
+   This panel is a full-width section, not one of the narrow forms .stack is
+   sized for -- the sentence it is built from does not survive a 460px column.
+   Three inherited rules have to be turned off by name rather than by avoiding
+   the classes, because .panel and .stack carry the framing and the spacing
+   that make it look like everything else. */
+form.target-sensitivity { max-width: none; }
+
+/* .stack label stacks its caption above its control, which is right for a
+   form and wrong for a sentence: "at least ₹ [50] and [2] %" is one line. */
+.field-row {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--s2) var(--s3);
+}
+.field-row label,
+.stack .field-row label {
+  flex-direction: row;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.field-row input[type="number"] { width: 6.5em; }
+
+/* Same treatment for the confirm-count line, which is also a sentence. */
+.stack-field,
+.stack .stack-field {
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.stack-field input[type="number"] { width: 5em; }
+.stack-field .muted { flex: 1 1 100%; font-size: 12px; }
+
+/* An override that is switched off still shows the numbers it would inherit,
+   so the panel reads as "this is what you would get" rather than going blank.
+   Dimmed, because they are not this hotel's values. */
+.sensitivity-fields.is-inherited { opacity: 0.55; }
+
+.checkbox,
+.stack .checkbox { flex-direction: row; align-items: flex-start; gap: 8px; font-size: 14px; }
+.checkbox input { margin-top: 3px; }
+
+.actions { display: flex; align-items: center; gap: var(--s3); }
+
+@media (max-width: 640px) {
+  .field-row { flex-direction: column; align-items: stretch; }
+}
+
+/* The verdict of a rate-application login test. A word and a colour, and the
+   probe's own sentence under it: the sentence is the part that says why, and
+   the part an owner reads twice. */
+.test-result {
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--line); background: var(--line-soft); font-size: 14px;
+}
+.test-result.ok { border-color: #bfe4d3; background: var(--down-bg); }
+.test-result.ok .test-verdict { color: var(--down); }
+.test-result.error { border-color: #f3c9c9; background: var(--up-bg); }
+.test-result.error .test-verdict { color: var(--up); }
+.test-result .test-message { margin: 6px 0 0; color: var(--ink-2); line-height: 1.45; }
+.test-result .test-shot { display: inline-block; margin-top: 6px; font-size: 13px; }
+/* The one-time-code question, shown only while the worker's browser is
+   waiting on it. Framed like the verdict so it reads as the same
+   conversation: the application asked, and this is where you answer. */
+.code-ask {
+  padding: 10px 12px; border-radius: var(--radius-sm);
+  border: 1px solid #e7d9a8; background: #fdf8e7; font-size: 14px;
+}
+.code-ask .code-prompt { margin: 0 0 8px; color: var(--ink-2); }
+.code-ask input[name=code] { width: 10em; letter-spacing: .12em; font-variant-numeric: tabular-nums; }
+
+/* -- repricing --------------------------------------------------------- */
+/* The proposals and the log are full-width sections: a table of eight
+   columns has no business inside the 460px .stack meant for a form. */
+.repricing-section { margin-bottom: var(--s5, 2rem); }
+.repricing-section > .panel { max-width: none; }
+.grid-wrap { overflow-x: auto; }
+.repricing-section .grid { width: 100%; }
+.repricing-section .grid td { vertical-align: top; }
+.repricing-section .grid details summary { cursor: pointer; white-space: nowrap; }
+.run-note { margin: var(--s2) 0 0; }
+/* The plan under a price. Amber when ours is not the plan we are compared
+   on, which is the one case where the two figures are not like for like. */
+.repricing-section .board { color: var(--muted); font-size: .85em; }
+.repricing-section .board-differs { color: var(--warn); font-weight: 600; }
+.repricing-run-form .actions { flex-wrap: wrap; }
+/* The tag says in one word what the sentence beside it explains. */
+.tag {
+  display: inline-block; padding: 0 .5em; border-radius: 999px; font-size: .8em;
+  font-weight: 600; line-height: 1.6; vertical-align: middle; margin-right: .3em;
+  background: #eeeae0; color: #4a544f;
+}
+.tag.ok, .tag.applied { background: #d1fae5; color: #065f46; }
+.tag.held, .tag.proposed, .tag.read, .tag.unchanged { background: #fef3c7; color: #92400e; }
+/* Applies, but does not achieve the gap: not a hold, not a clean move. Read
+   as a warning rather than a success, because the green one was being read
+   as "the rule is satisfied" on a row that sat above the hotel it follows. */
+.tag.short { background: #ffe4e6; color: #9f1239; }
+/* Caught up: quieter than "will apply", because it is not an offer. */
+.tag.settled { background: var(--line-soft); color: var(--ink-2); }
+.tag.failed { background: #ffe4e6; color: #9f1239; }
+tr.held td { color: var(--muted); }
+ul.plain { list-style: none; padding: 0; margin: .3em 0 0; }
+ul.plain li { padding: .1em 0; }
+/* The competitor list opens INSIDE its column: capped in width so the
+   names wrap instead of pushing the table out of its box, with the price
+   as a fixed-width lead so the hotels line up under one another. */
+.repricing-section .grid td.competitors { max-width: 24em; min-width: 16em; }
+.repricing-section .grid td.competitors li { display: flex; gap: .6em; align-items: baseline; line-height: 1.3; padding: .2em 0; }
+.repricing-section .grid td.competitors li .num { flex: 0 0 5.5em; text-align: right; }
+.repricing-section .grid td.competitors li .who { flex: 1 1 auto; min-width: 0; }
+.repricing-section .grid td.competitors li small { display: block; font-size: 12px; line-height: 1.25; }
+.repricing-section .grid td.room { min-width: 11em; }
+/* THE HELD REASON IS A SENTENCE, so its column has to be wide enough to be
+   one. Without a width it took whatever the other nine columns left over,
+   which was about four characters: "we have no breakfast rate on sale
+   tonight..." came out one word per line and stretched the row past 400px,
+   pushing the two rooms that matter off the screen. The table already
+   scrolls sideways (.grid-wrap), so the width costs nothing but a scroll. */
+.repricing-section .grid td.status { min-width: 16em; max-width: 26em; }
+.repricing-section .grid td.status .muted {
+  display: block; font-size: 12px; line-height: 1.4; margin-top: .25em;
+}
+/* The money columns never wrap a number onto two lines. */
+.repricing-section .grid td.rms,
+.repricing-section .grid td.site,
+.repricing-section .grid td.market { min-width: 9em; white-space: normal; }
+.repricing-section .grid td.rms .muted,
+.repricing-section .grid td.site .muted { display: block; font-size: 12px; line-height: 1.35; }
+.repricing-section .grid td.proposed { min-width: 10em; }
+/* The rule: its numbers in columns. The automatic switch is no longer one of
+   them -- it sits beside Apply, where the other two ways of writing a rate
+   are. See .auto-toggle. */
+.rule-form { max-width: none; }
+/* THE AUTOMATIC SWITCH, beside Preview and Apply.
+   Built as a <button role="switch"> rather than a checkbox: it is an action
+   with a consequence, not a field waiting for a Save, and it carries the same
+   weight on the row as the two buttons it sits with. Pushed to the far end so
+   it cannot be hit while reaching for Apply. */
+.auto-toggle {
+  display: inline-flex; align-items: center; gap: var(--s2);
+  margin-left: auto; padding: 6px 12px 6px 8px;
+  background: var(--panel); color: var(--ink-2);
+  border: 1px solid var(--line); border-radius: 999px;
+  font: inherit; font-size: 13px; cursor: pointer; text-align: left;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.auto-toggle:hover:not(:disabled) { border-color: var(--accent); color: var(--ink); }
+.auto-toggle:disabled { opacity: .5; cursor: not-allowed; }
+.auto-toggle.busy { opacity: .6; cursor: progress; }
+.auto-track {
+  position: relative; flex: none; width: 34px; height: 20px;
+  background: var(--line); border-radius: 999px; transition: background .15s;
+}
+.auto-knob {
+  position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  background: #fff; border-radius: 50%; transition: transform .15s;
+  box-shadow: 0 1px 2px rgb(0 0 0 / .25);
+}
+.auto-label { display: flex; flex-direction: column; line-height: 1.25; font-weight: 600; }
+.auto-label small { font-weight: 400; font-size: 11px; color: var(--ink-2); }
+
+/* ON IS NOT A COLOUR CHANGE ALONE. Rates moving unattended is the page's one
+   irreversible state, so it announces itself: the track fills, the knob
+   travels, and the label says what it will do rather than that it is "on". */
+.auto-toggle.on { border-color: var(--accent); color: var(--ink); background: var(--accent-bg); }
+.auto-toggle.on .auto-track { background: var(--accent); }
+.auto-toggle.on .auto-knob { transform: translateX(14px); }
+.auto-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 640px) {
+  /* Its own line: at this width margin-left:auto puts it against Apply. */
+  .auto-toggle { margin-left: 0; width: 100%; }
+}
+
+/* THE RMS CELL LISTS EVERY ROW APPLY WILL WRITE, not just the rule's own.
+   The plan's name leads each line so three numbers in a narrow column read as
+   three rates rather than one sum with workings. The followers are quieter:
+   they are consequences of the first line, not decisions. */
+/* THE DATA SOURCE FORMS, under a table that spans the panel.
+   They were `.stack`, which is a 460px column -- right for a form of several
+   fields, wrong for one field and a button. Every button stretched to 460px,
+   the caption sat on its own line above a lonely input, and the whole thing
+   hugged the left edge of a full-width panel with white space beside it. A
+   URL is a long value: give it the room the table above it already takes. */
+.source-forms { margin-top: var(--s4); }
+.source-form {
+  display: flex; flex-direction: column; gap: 6px;
+  max-width: 880px; margin-bottom: var(--s4);
+}
+.source-form-label { font-size: 13px; color: var(--ink-2); font-weight: 600; }
+.source-form-label .muted { font-weight: 400; }
+.source-form .field-row { display: flex; gap: var(--s2); align-items: center; }
+/* min-width:0 or the input refuses to shrink below its size attribute and
+   pushes the button off the panel on a narrow window. */
+.source-form .field-row input { flex: 1 1 auto; min-width: 0; }
+.source-form .field-row button { flex: 0 0 auto; white-space: nowrap; }
+.source-form .form-status { margin: 0; }
+.source-forms-note, .source-form > .muted {
+  max-width: 880px; margin: 0 0 var(--s4); font-size: 12px; line-height: 1.5;
+}
+.source-form-add { margin-top: var(--s5); }
+
+@media (max-width: 720px) {
+  /* The button under the field rather than beside it: at this width they
+     would each be too narrow to read. */
+  .source-form .field-row { flex-direction: column; align-items: stretch; }
+}
+
+.rms-plan { display: inline-block; white-space: nowrap; }
+.rms-plan .plan {
+  display: inline-block; min-width: 2.6em; margin-right: 4px;
+  font-size: 11px; font-weight: 600; color: var(--ink-2); text-align: left;
+}
+.rms-plan.follows { color: var(--ink-2); font-size: 12px; }
+.rms-plan.follows strong { font-weight: 600; }
+
+.rule-fields {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--s3) var(--s4); margin-bottom: var(--s3);
+}
+.rule-fields label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--ink-2); }
+.rule-fields input { width: 100%; box-sizing: border-box; }
+.rule-fields small { font-size: 12px; }
+.with-unit { display: flex; align-items: center; gap: 6px; }
+.with-unit input { flex: 1 1 auto; min-width: 0; }
+.with-unit .unit { color: var(--muted); font-size: 13px; }
+
+/* A SELECT IS SIZED BY ITS LONGEST OPTION, not by its column. The numbers
+   above are inputs and were held to the column width; a dropdown holding
+   "Mountain View Classic Room" was not, so it pushed its own cell wider than
+   the 190px track and the box drew itself outside the panel. Grid items also
+   default to min-width: auto, which is what let the track give way. */
+.rule-fields label { min-width: 0; }
+.rule-fields select { width: 100%; min-width: 0; box-sizing: border-box; }
+
+/* THE SWITCHES. A checkbox is not a field to fill in, so none of the sizing
+   above is meant for it, and two browser defaults were left standing:
+   - a checkbox carries a margin of the browser's own (3px 3px 3px 4px in
+     Chrome), so the Automatic row drew its box 4px inside the column that
+     every label and input below it starts at — the one row on the form whose
+     left edge did not line up. Set on all four sides: flush on the left, and
+     enough on top to sit on the middle of the first line of its sentence.
+   - .rule-fields label is a column of "caption above field", which a checkbox
+     row is not: it dropped the sentence onto the line below its own box. */
+.rule-form .checkbox input[type="checkbox"] {
+  width: auto; flex: 0 0 auto; margin: 4px 0 0;
+}
+.rule-fields label.checkbox { flex-direction: row; align-items: flex-start; gap: var(--s2); }
+
+/* A field that carries a sentence, or a set of its own, needs more than one
+   190px column: in one column the prose falls into a ribbon four words wide
+   and the dropdown does not fit its own options. A set takes the whole row; a
+   label with a paragraph takes two columns, which is a reading measure rather
+   than a ribbon and still leaves the field beside it on the same row. The
+   two-column span waits for a window wide enough to hold three columns, so it
+   can never ask the grid for a track that is not there. */
+.rule-fields .wide { grid-column: 1 / -1; }
+.rule-fields .wide > select { max-width: 32em; }
+.rule-fields .wide > small { max-width: 60em; }
+/* The note under a checkbox sits inside the sentence's span, so it inherits
+   inline and a measure means nothing to it: on a full-width row it ran the
+   whole window. Blocked, it reads like every other note on the form. */
+.rule-fields .checkbox small { display: block; max-width: 60em; margin-top: 2px; }
+@media (min-width: 720px) {
+  .rule-fields label.wide:not(.checkbox) { grid-column: span 2; }
+}
+
+/* WHICH ROOM OF THEIRS EACH OF OURS COMPETES WITH: one question, so one box,
+   with the pairs in the same column rhythm as the numbers above it. Boxed
+   like .channel-set, which is the same shape of thing — a fieldset whose
+   legend names a set rather than a field. */
+.rule-fields .room-pairs {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--s3) var(--s4); align-items: start;
+  margin: 0; padding: var(--s3) var(--s4);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--panel); min-width: 0;
+}
+.room-pairs legend {
+  padding: 0 var(--s2);
+  font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--muted);
+}
+/* The empty-state sentence sits under the legend, not in the first column. */
+.room-pairs > p { grid-column: 1 / -1; margin: 0; font-size: 13px; }
+
+/* Room mapping: one grid, one form per row (display: contents keeps each
+   form's cells in the grid and the form itself the thing that submits). */
+.mapping-grid {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.2fr) minmax(120px, 1fr) repeat(3, minmax(120px, 1fr)) 6em 6em 2.2em auto;
+  gap: 8px 10px; align-items: center; max-width: none; overflow-x: auto;
+}
+.mapping-grid > form { display: contents; }
+.mapping-head {
+  font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); padding-bottom: 4px; border-bottom: 1px solid var(--line);
+}
+.mapping-grid input[type="text"], .mapping-grid input[type="number"] { width: 100%; box-sizing: border-box; padding: 5px 8px; font-size: 13px; }
+.mapping-grid input[type="checkbox"] { margin: 0; }
+.mapping-on { text-align: center; }
+.mapping-name { font-size: 14px; line-height: 1.25; }
+.mapping-save { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.mapping-save .form-status:empty { display: none; }
+button.small { padding: 5px 12px; font-size: 13px; }
+@media (max-width: 900px) {
+  .mapping-grid { grid-template-columns: 1fr 1fr; }
+  .mapping-head { display: none; }
+  .mapping-name, .mapping-save { grid-column: 1 / -1; }
+}
+
+/* The proposed price is a box the owner may type over; a row they changed
+   is marked so it cannot be mistaken for the rule's proposal. */
+.repricing-section .grid td.proposed input.proposed-price {
+  width: 7.5em; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums;
+}
+.repricing-section .grid tr.edited td.proposed input.proposed-price { border-color: #b45309; background: #fffbeb; }
+.repricing-section .grid tr.held td.proposed input.proposed-price { color: var(--ink, inherit); }
+/* The model's opinion: read beside the proposal, never applied. */
+.repricing-section .grid td.ai { min-width: 11em; max-width: 18em; }
+.repricing-section .grid td.ai > .muted { display: block; font-size: 12px; }
+.repricing-section .grid td.ai .ai-why { margin: .3em 0; font-size: 13px; line-height: 1.35; }
+/* The Booking.com tick under a room: whether Apply writes it. */
+.repricing-section .grid tr.channels-row td { padding-top: 0; border-top: 0; }
+.repricing-section .grid tr.channels-row + tr td, .repricing-section .grid tr:has(+ tr.channels-row) td { border-bottom: 0; }
+.channel-picks { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; font-size: 13px; padding: 6px 0 4px; }
+.channel-picks-label { color: var(--muted); font-weight: 600; margin-right: 2px; }
+.channel-pick {
+  display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  border: 1px solid var(--line, #d8dfd9); background: var(--card, #fff); cursor: pointer; white-space: nowrap;
+}
+.channel-pick:has(input[type="checkbox"]:checked) { border-color: #19704F; background: #e6f3ec; }
+/* A room's row and its "Change in RMS" row read as one. */
+.repricing-section .grid tr.room-view:not([hidden]) td { border-bottom: 0; }
+/* Sold-out rooms in the band table are history, not offers: kept small so a
+   hotel with seven full rooms does not make its row a screen tall. */
+.band-room.cell-soldout { padding: 3px 7px; margin-bottom: 3px; }
+.band-room.cell-soldout .cell-room,
+.band-room.cell-soldout .cell-was { font-size: 10.5px; line-height: 1.3; }
+.matrix-bands .band-cell:last-child { min-width: 200px; }
+
+/* Other websites' rules on the Repricing page (Agoda, Goibibo). */
+.lanes .lane { margin-bottom: 1.25rem; }
+.lanes .lane h3 { margin: 0 0 .5rem; }
+.lanes .lane h3 small { font-weight: normal; }
+.lane-fields { display: flex; flex-wrap: wrap; gap: .75rem 1.25rem; align-items: end; margin: .5rem 0; }
+.lane-fields label { display: flex; flex-direction: column; gap: .25rem; }
+.lane-pairs { margin: .5rem 0; }
+.lane-pairs select { max-width: 22rem; }
+.lane-settings { margin-top: .75rem; }
+.lane-settings > summary { cursor: pointer; }
+.lane-run-form .actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; margin-top: .75rem; }

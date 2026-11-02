@@ -1,0 +1,318 @@
+"""Turning what a page displays into a number we can trust.
+
+Pure functions, so they can be tested against the real strings collected
+during the source spike without a browser.
+
+The guiding principle is **refuse rather than guess**. Every parsed price is
+bounds-checked, and anything implausible raises instead of being stored. A
+missing price shows up as a visible gap that gets fixed; a wrong price silently
+poisons a series and fires false alerts for weeks.
+"""
+from __future__ import annotations
+
+import re
+from decimal import Decimal, InvalidOperation
+
+from app.core.errors import SchemaDriftError
+
+# Sanity bounds for an Indian hotel room, per night, in INR.
+# A parse landing outside this is a parsing bug, not a bargain.
+MIN_PLAUSIBLE_PRICE = Decimal("100")
+MAX_PLAUSIBLE_PRICE = Decimal("500000")
+
+#: Elements whose CLASS states the currency because the page never writes it as
+#: a character. Font Awesome's "fa fa-inr" and the older WebRupee font paint the
+#: symbol from a CSS ::before rule, leaving bare digits in the DOM -- so on
+#: those pages this selector is the ONLY place the currency is stated.
+#:
+#: Here rather than beside either of its two readers. The DOM scan asks it in
+#: JavaScript and discovery asks it in Python, and the day the two disagreed
+#: about what names a currency, a page would be learnable and uncorroboratable
+#: at the same time.
+CURRENCY_ICON_SELECTOR = '[class*="inr" i],[class*="rupee" i],[class*="webrupee" i]'
+
+_CURRENCY_SYMBOLS = {
+    "₹": "INR",  # rupee sign
+    "rs.": "INR",
+    "rs": "INR",
+    "inr": "INR",
+    "$": "USD",
+    "usd": "USD",
+    "€": "EUR",
+    "£": "GBP",
+}
+
+# Strips currency symbols, thin/non-breaking spaces and stray words, keeping
+# only digits and separators.
+_NUMBER_RE = re.compile(r"[-+]?\d[\d,.   ]*\d|\d")
+# Each marker must be a phrase that ANNOUNCES unavailability, never a
+# fragment that can turn up in ordinary interface copy.
+#
+# "no rooms" used to be on this list and cost a hotel a whole day of prices:
+# a booking page prompting "No rooms selected yet. Choose a room to continue
+# your booking." was read as the hotel declaring itself full, and the room it
+# was offering at 2,017 rupees went on the dashboard as "sold out".
+#
+# The two ways of being wrong here are not symmetrical. Missing a real
+# sold-out means the price selector finds nothing, which raises SchemaDrift
+# and puts a visible error in front of a person. Inventing one writes a
+# confident business fact, tells whoever watches that hotel, and looks
+# exactly like a correct answer. So these stay narrow on purpose: matching
+# fewer real sold-outs is the cheaper mistake.
+# Word ORDER is the other way these get missed. "no rooms available" was on
+# this list from the start; HCG Murmuring Nest's engine prints
+#
+#     No available rooms on the selected dates, Please select new dates !
+#
+# which says the same thing with the adjective in front, and matched nothing.
+# The whole page was 424 characters long -- the notice was most of it -- and
+# it was filed every half hour as "almost certainly a redesign", against a
+# booking engine that had not changed at all. Both orders are now listed;
+# "no available room" is a prefix of the plural, so one entry covers both.
+_SOLD_OUT_MARKERS = (
+    "sold out", "soldout",
+    "no rooms available", "no rooms left", "no rooms found",
+    "no available room",
+    "no room available", "rooms are not available", "not available for",
+    "no availability", "not currently available", "no longer available",
+    "fully booked", "houseful", "no vacancies",
+)
+
+# Plenty of booking pages say in words which side of the tax their headline
+# number sits on -- "Room Rates Exclusive of Tax Rs 3,200.00" is a real
+# example. Read literally it is free, reliable information about a figure we
+# would otherwise have to label by guesswork.
+_TAX_EXCLUSIVE_MARKERS = (
+    "exclusive of tax", "excluding tax", "excluding taxes", "excl. tax",
+    "excl tax", "before tax", "plus tax", "plus taxes", "+ tax", "+ taxes",
+    "tax extra", "taxes extra", "extra taxes",
+)
+
+# The same statement made with the amount in it: "+ Rs 1,836 taxes & fees".
+#
+# The literal markers above cannot see this. They look for "+ taxes", and an
+# OTA that prints the figure it is about to add puts the number in between --
+# so the most explicit way a page can say "this headline is pre-tax", with the
+# tax spelled out beside it, was the one phrasing that read as silence. The
+# headline was then filed as the all-in price and the stated tax discarded,
+# on every card of every site that words it this way.
+#
+# A currency symbol is optional because plenty of cards write it once, on the
+# headline, and leave the tax bare. The trailing word is required: it is what
+# separates a tax line from "TV + 13 more".
+_TAX_ADDED_RE = re.compile(
+    r"""(?:\+|\bplus\b)\s*                     # the addition itself
+        (?:₹|rs\.?|inr|\$|usd|€|£)?\s*          # currency, if it repeats it
+        (?P<amount>\d[\d,.]*\d|\d)\s*           # the amount
+        (?:&\s*)?
+        (?:tax(?:es)?|fees?|gst|vat)\b                # what it is
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+_TAX_INCLUSIVE_MARKERS = (
+    "inclusive of tax", "including tax", "including taxes", "incl. tax",
+    "incl tax", "tax included", "taxes included", "all inclusive",
+    "inclusive of all taxes",
+)
+
+
+def detect_currency(text: str, default: str = "INR") -> str:
+    lowered = text.lower()
+    for symbol, code in _CURRENCY_SYMBOLS.items():
+        if symbol in lowered:
+            return code
+    return default
+
+
+# Phrases that mean "this room cannot be booked" ONLY when they are read
+# inside a single room card, and only when that card shows no price.
+#
+# Bare "Not Available" is the one that matters and the one that cannot go in
+# the list above. Applied to a whole page it is caught by the legend every
+# eZee booking engine prints -- "* Available  x Not Available" -- which is on
+# the page whether the hotel is full or empty, so a page that had simply
+# failed to load its rates would be recorded as a hotel with no rooms, and
+# whoever watches that hotel would be told so.
+#
+# The two conditions are what make it safe, and both are load-bearing:
+#
+#   inside one card   the legend, the filter sidebar and the footer are all
+#                     outside every card, so none of them can vote
+#   showing no price  "Breakfast not available" on a bookable room is a real
+#                     sentence on real booking pages. A card with a readable
+#                     price is available, whatever else it says.
+_CARD_SOLD_OUT_MARKERS = _SOLD_OUT_MARKERS + (
+    "not available",
+    "unavailable",
+    "not bookable",
+    "no rooms",
+)
+
+
+def looks_sold_out(text: str) -> bool:
+    """Whether a page fragment is announcing no availability.
+
+    Used to distinguish "the hotel says no rooms" (a business fact worth
+    recording) from "we found nothing" (a bug worth alerting on).
+    """
+    lowered = " ".join(text.lower().split())
+    return any(marker in lowered for marker in _SOLD_OUT_MARKERS)
+
+
+def card_looks_sold_out(card_text: str) -> bool:
+    """Whether ONE room card, already known to show no price, says why.
+
+    Do not call this on anything wider than a single card, and do not call it
+    on a card whose price parsed -- see :data:`_CARD_SOLD_OUT_MARKERS` for
+    what each of those conditions is holding back.
+    """
+    lowered = " ".join((card_text or "").lower().split())
+    return any(marker in lowered for marker in _CARD_SOLD_OUT_MARKERS)
+
+
+def _normalise_number(raw: str) -> str:
+    """Handle Indian, European and plain number formats.
+
+    "2,500" / "2.500" / "2 500" all mean 2500; "2,500.50" means 2500.50.
+    Indian grouping ("1,23,456") is handled by simply dropping the separators.
+    """
+    cleaned = raw.strip().replace(" ", "").replace(" ", "").replace(" ", "")
+
+    has_comma, has_dot = "," in cleaned, "." in cleaned
+    if has_comma and has_dot:
+        # Whichever appears last is the decimal separator.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif has_comma:
+        # A single comma with exactly two trailing digits is a decimal comma;
+        # anything else is thousands grouping.
+        cleaned = (
+            cleaned.replace(",", ".")
+            if re.fullmatch(r"\d+,\d{2}", cleaned)
+            else cleaned.replace(",", "")
+        )
+    elif has_dot and re.fullmatch(r"\d{1,3}(\.\d{3})+", cleaned):
+        cleaned = cleaned.replace(".", "")  # European grouping, not a decimal
+    return cleaned
+
+
+def parse_price(
+    text: str | None,
+    *,
+    field_name: str = "price",
+    min_value: Decimal = MIN_PLAUSIBLE_PRICE,
+    max_value: Decimal = MAX_PLAUSIBLE_PRICE,
+) -> Decimal:
+    """Extract a price, or raise ``SchemaDriftError``.
+
+    Raising rather than returning ``None`` is deliberate: a page that loaded
+    but no longer shows a parseable price is almost always a redesign, and that
+    needs a human, not a retry.
+    """
+    if not text or not text.strip():
+        raise SchemaDriftError(f"No text to parse a {field_name} from")
+
+    match = _NUMBER_RE.search(text)
+    if not match:
+        raise SchemaDriftError(
+            f"No number found in {field_name}: {text[:80]!r}",
+            context={"raw": text[:200]},
+        )
+
+    try:
+        value = Decimal(_normalise_number(match.group()))
+    except (InvalidOperation, ValueError) as exc:
+        raise SchemaDriftError(
+            f"Could not parse {field_name} from {text[:80]!r}",
+            context={"raw": text[:200]},
+        ) from exc
+
+    if not (min_value <= value <= max_value):
+        # The classic failure this catches: picking up a review count, a room
+        # number, or a discount percentage instead of the nightly rate.
+        raise SchemaDriftError(
+            f"Parsed {field_name} {value} is outside the plausible range "
+            f"{min_value}-{max_value}; the selector is probably matching the "
+            f"wrong element",
+            context={"raw": text[:200], "parsed": str(value)},
+        )
+    return value
+
+
+def parse_price_or_none(text: str | None, **kwargs) -> Decimal | None:
+    """Non-raising variant, for genuinely optional fields such as taxes."""
+    try:
+        return parse_price(text, min_value=Decimal("0"), **kwargs)
+    except SchemaDriftError:
+        return None
+
+
+def parse_rooms_left(text: str | None) -> int | None:
+    """Extract "only 2 rooms left" style urgency counts.
+
+    Purely informational: it is never used in a price comparison, because
+    these counters are frequently a marketing device rather than real stock.
+    """
+    if not text:
+        return None
+    if (match := re.search(r"\b(\d{1,3})\b", text)) and looks_urgency(text):
+        value = int(match.group(1))
+        return value if 0 < value <= 100 else None
+    return None
+
+
+def looks_urgency(text: str) -> bool:
+    lowered = text.lower()
+    return any(w in lowered for w in ("left", "remaining", "last", "only"))
+
+
+def parse_added_taxes(text: str | None) -> Decimal | None:
+    """The tax a card says it will ADD to its headline: "+ Rs 1,836 taxes".
+
+    Returns ``None`` when the page states no such figure -- which is most of
+    them. This is the amount a page volunteers, never a computed one: a tax
+    derived by subtracting two numbers we scraped separately would be a guess
+    dressed as a fact, and it would be wrong the first time a card showed a
+    discount instead of a tax.
+
+    Bounds-checked like every other parse, and against the price bounds rather
+    than a tax-shaped range, because a selector that has drifted onto the rate
+    is exactly what this has to refuse. Zero is allowed: a page saying "+ Rs 0
+    taxes" is stating something true.
+    """
+    if not text:
+        return None
+    match = _TAX_ADDED_RE.search(" ".join(text.split()))
+    if not match:
+        return None
+    return parse_price_or_none(match.group("amount"), field_name="taxes_fees")
+
+
+def declared_tax_basis(text: str | None) -> str | None:
+    """Which side of the tax a page says its headline price is on.
+
+    Returns ``"exclusive"``, ``"inclusive"`` or ``None`` when the page does not
+    say. Only stated intent counts -- nothing is inferred from the number
+    itself, because a rate that merely looks round is not evidence.
+
+    Both phrasings on one card means the page is describing two different
+    figures ("Rs 3,200 exclusive of tax, Rs 3,360 inclusive"), and the scraper
+    has only captured one of them. Which one is unknowable from here, so the
+    honest answer is ``None``: the caller keeps its existing behaviour instead
+    of labelling a number on a coin toss.
+    """
+    if not text:
+        return None
+    lowered = " ".join(text.lower().split())
+    exclusive = (
+        any(marker in lowered for marker in _TAX_EXCLUSIVE_MARKERS)
+        or _TAX_ADDED_RE.search(lowered) is not None
+    )
+    inclusive = any(marker in lowered for marker in _TAX_INCLUSIVE_MARKERS)
+    if exclusive and not inclusive:
+        return "exclusive"
+    if inclusive and not exclusive:
+        return "inclusive"
+    return None

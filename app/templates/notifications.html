@@ -1,0 +1,139 @@
+{% extends "base.html" %}
+{% block title %}Alerts · Hotel Price Monitor{% endblock %}
+
+{% block content %}
+<h1>Alerts</h1>
+<p class="muted">
+  What was actually delivered. One row is one message to one person — all
+  of a hotel's changes inside a 60-second window are batched into a single
+  message, because a weekend-wide reprice can produce a hundred changes and
+  a hundred separate alerts is how the system gets muted.
+</p>
+
+<p class="muted">
+  Who receives them, and on which number, is under <a href="/settings">Settings</a>.
+</p>
+
+<section>
+  <h2>Delivery history</h2>
+  {# Lanes here too. Detail carries a whole subject line, and left to size
+     itself it widened the table past the window and scrolled the page. #}
+  {# Twelve rows, then a scrollbar: the history is newest first, and the
+     message somebody came here to check is in the first few. #}
+  <div class="scroll-x scroll-rows" data-rows="12">
+  <table class="grid grid-history">
+    <colgroup>
+      <col class="col-when"><col class="col-to"><col class="col-hotel">
+      <col class="col-channel"><col class="col-status"><col class="col-detail">
+      <col class="col-actions">
+    </colgroup>
+    <thead>
+      <tr><th>Created</th><th>To</th><th>Hotel</th><th>Channel</th><th>Status</th><th>Detail</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for notification, recipient_name, hotel_name in notifications %}
+      <tr>
+        <td class="nowrap muted">{{ notification.created_at|localtime('%d %b %H:%M') }}</td>
+        <td>{{ recipient_name }}</td>
+        <td>{{ hotel_name or '—' }}</td>
+        <td>{{ notification.channel }} <span class="muted">{{ notification.provider }}</span></td>
+        <td>
+          <span class="pill pill-{{ {'sent':'ok','delivered':'ok','read':'ok','failed':'stop','queued':'warn'}.get(notification.status.value, 'off') }}">
+            {{ notification.status.value }}
+          </span>
+          {% if notification.scheduled_for %}
+            <span class="pill pill-pending" title="Held for quiet hours or the hourly cap">
+              held → {{ notification.scheduled_for|localtime('%d %b %H:%M') }}
+            </span>
+          {% endif %}
+        </td>
+        {# One line, clipped to the lane, whole text in the tooltip. #}
+        <td class="truncate muted"
+            title="{{ notification.error_detail or notification.subject or '' }}">
+          {{ notification.error_detail or notification.subject or '' }}
+        </td>
+        <td>
+          {% if is_admin and notification.status.value == 'failed' %}
+          <button class="resend-notification" data-notification-id="{{ notification.id }}">
+            Resend
+          </button>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="7" class="muted">Nothing sent in this window.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="repricing-section" id="repricer-log">
+  <h2>What the repricer did</h2>
+  {% set changes_only = changes_only if changes_only is defined else true %}
+  {% set log_day = log_day if log_day is defined else none %}
+  {% set day_q = log_day.isoformat() if log_day else '' %}
+  <p class="muted">
+    {% if changes_only %}
+      Only the rates that were changed in RMS, and any change RMS refused. Newest first.
+    {% else %}
+      Every decision, including the ones that changed nothing. Newest first.
+    {% endif %}
+    The rule that makes them, and tonight's proposals, are on
+    <a href="/repricing">Repricing</a>.
+  </p>
+  {# Changes first: the log is every 30-minute decision, and the few that
+     moved a rate -- the ones anybody opens this for -- were lost among the
+     "unchanged" and "held" rows around them. #}
+  <form class="filters" method="get" action="/notifications#repricer-log">
+    <div class="chips chips-filter">
+      <span class="chips-label">Show</span>
+      <a class="chip {{ 'is-on' if changes_only else '' }}"
+         href="/notifications?hours={{ hours }}&log=changes{% if day_q %}&day={{ day_q }}{% endif %}#repricer-log">Changes only</a>
+      <a class="chip {{ '' if changes_only else 'is-on' }}"
+         href="/notifications?hours={{ hours }}&log=all{% if day_q %}&day={{ day_q }}{% endif %}#repricer-log">All decisions</a>
+    </div>
+    <input type="hidden" name="hours" value="{{ hours }}">
+    <input type="hidden" name="log" value="{{ 'changes' if changes_only else 'all' }}">
+    <label>Day
+      <input type="date" name="day" value="{{ log_day.isoformat() if log_day else '' }}">
+    </label>
+    <button type="submit">Show</button>
+    {% if log_day %}
+      <a href="/notifications?hours={{ hours }}&log={{ 'changes' if changes_only else 'all' }}#repricer-log">Any day</a>
+    {% endif %}
+  </form>
+  {% if not actions %}
+    <p class="muted">
+      {% if changes_only %}No rate was changed{% else %}Nothing was decided{% endif %}{% if log_day %} on {{ log_day.strftime('%d %b %Y') }}{% else %} yet{% endif %}.
+    </p>
+  {% else %}
+  <div class="grid-wrap">
+  <table class="grid">
+    <thead>
+      <tr><th>When</th><th>Mode</th><th>Room</th><th>Plan</th><th class="num" title="The benchmark's price when the row was priced against one; otherwise the market median">Market</th><th class="num">Target</th><th class="num">RMS was</th><th class="num">RMS set</th><th>Status</th></tr>
+    </thead>
+    <tbody>
+    {% for a in actions %}
+      <tr class="{{ a.status }}">
+        <td>{{ a.created_at | localtime }}</td>
+        <td>{{ a.mode }}</td>
+        <td>{{ a.room_name or '—' }}{% if a.rms_room %} <span class="muted">/ {{ a.rms_room }}</span>{% endif %}</td>
+        <td>{{ a.plan or '—' }}</td>
+        <td class="num">{{ money(a.market_price) if a.market_price is not none else '—' }}</td>
+        <td class="num">{{ money(a.target_price) if a.target_price is not none else '—' }}</td>
+        <td class="num">{{ money(a.current_rms) if a.current_rms is not none else '—' }}</td>
+        <td class="num">{{ money(a.applied_rms) if a.applied_rms is not none else (money(a.proposed_rms) ~ ' (proposed)' if a.proposed_rms is not none else '—') }}</td>
+        <td>
+          <span class="tag {{ a.status }}">{{ a.status }}</span>
+          {% if a.reason %}<span class="muted">{{ a.reason }}</span>{% endif %}
+          {% if a.screenshot_path %} <a href="/api/v1/repricing/actions/{{ a.id }}/screenshot" target="_blank" rel="noopener">grid</a>{% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}

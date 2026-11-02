@@ -1,0 +1,52 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+storage_state*.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# runtime data
+data/
+artifacts/
+*.log
+
+# os / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# native dev stack (portable postgres + redis, data, logs) — machine-local
+.local/
+.venv312/
+
+# celery beat's own bookkeeping: rewritten every tick, meaningless in a diff,
+# and a guaranteed conflict on any branch that has run the scheduler.
+celerybeat-schedule*
+celerybeat.pid
+
+# probe screenshots. The HTML fixtures are kept as test material; the PNGs are
+# for a human looking at a failure once, and are large.
+tests/fixtures/probe/*.png
+
+# database dumps. Real data and, in a plain-format dump, real credentials
+# hashes — never in git. Copy these off the box instead.
+backups/
+
+# local runtime (never publish)
+.local/
+.venv*/
+*.dump

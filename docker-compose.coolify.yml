@@ -1,0 +1,234 @@
+# Production stack for Coolify (single compose file, deployed from git).
+#
+# Coolify deploys ONE compose file — it never merges, so
+# docker-compose.override.yml (development) is invisible here and this file
+# has to be self-contained. It is deliberately a sibling of
+# docker-compose.yml rather than an overlay on it, because three things in
+# the base file are actively wrong on a Coolify host:
+#
+#   1. `ports: "8000:8000"` on api. Coolify's own UI owns host port 8000, so
+#      that binding is a refused deploy, not a warning. Nothing here binds a
+#      host port at all: ingress is the Coolify proxy (see SERVICE_FQDN
+#      below) and everything else talks over the compose network.
+#   2. mailhog. It catches development email; in production a real provider
+#      does, so it is gone. Set EMAIL_PROVIDER/SMTP_* in Coolify's env vars.
+#   3. `./backups`. Coolify re-clones the repository on every deploy, so a
+#      bind mount under the source tree loses every dump the moment you
+#      redeploy — exactly the failure the backup service exists to prevent.
+#      It points at an absolute host path instead.
+#
+# Secrets come from Coolify's environment variables, which it writes to a
+# .env beside this file. The three the app cannot start without are written
+# `${VAR:?message}`, but do not read that as a fail-fast guard here the way
+# it would be under plain `docker compose`: Coolify parses this file, creates
+# each variable for you, and takes the MESSAGE as the default value. A secret
+# still reading "set ... in Coolify" in the UI is one nobody ever filled in,
+# and it will deploy quite happily with that as the password.
+
+x-app-env: &app-env
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    APP_ENV: ${APP_ENV:-production}
+    # Overridden here, not in .env: these are compose service names, and are
+    # the one part of the configuration the host cannot get right.
+    POSTGRES_HOST: postgres
+    REDIS_HOST: redis
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in Coolify}
+    SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in Coolify}
+    CREDENTIAL_KEK: ${CREDENTIAL_KEK:?set CREDENTIAL_KEK in Coolify}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hotelmonitor}
+      POSTGRES_USER: ${POSTGRES_USER:-hotelmonitor_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in Coolify}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hotelmonitor_app}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    # appendonly: a restart must not silently drop queued price checks.
+    # noeviction: the broker must never evict a task to reclaim memory.
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # One-shot: runs migrations, then exits. Everything else waits for it, so no
+  # container can start against an out-of-date schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    <<: *app-env
+    command: ["alembic", "upgrade", "head"]
+    # Dockerfile.api's HEALTHCHECK curls :8000/health, which is right for that
+    # image's default gunicorn CMD and wrong for this one. Left enabled, this
+    # container is permanently "unhealthy" and Coolify reports the whole
+    # resource as degraded.
+    healthcheck:
+      disable: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    <<: *app-env
+    # Nothing binds a host port; the proxy reaches this container over the
+    # compose network. `expose` is how Coolify learns which port the domain
+    # belongs to. SERVICE_FQDN_API_8000 is the documented way to ask for it
+    # and does not work under the dockercompose build pack -- it generated a
+    # domain for `migrate`, a container that exits by design, and served 404
+    # for everything. The domain is set on the resource instead.
+    expose:
+      - "8000"
+    volumes:
+      - artifacts:/data/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Heavy browser work, isolated: its own image, its own queue, its own memory
+  # cap. A Chromium leak here cannot starve Postgres.
+  worker-browser:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.browser
+    <<: *app-env
+    volumes:
+      - artifacts:/data/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    mem_limit: 4g
+    shm_size: 1gb          # Chromium crashes with the 64MB Docker default
+    restart: unless-stopped
+
+  # Light work: HTTP-only adapters and everything that is not a browser.
+  worker-http:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    <<: *app-env
+    command: ["celery", "-A", "app.workers.celery_app", "worker",
+              "-Q", "http", "-c", "8", "-Ofair", "--loglevel", "INFO"]
+    # Dockerfile.api's HEALTHCHECK curls :8000/health, which is right for that
+    # image's default gunicorn CMD and wrong for this one. Left enabled, this
+    # container is permanently "unhealthy" and Coolify reports the whole
+    # resource as degraded.
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker-notify:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    <<: *app-env
+    command: ["celery", "-A", "app.workers.celery_app", "worker",
+              "-Q", "notify", "-c", "4", "--loglevel", "INFO"]
+    # Dockerfile.api's HEALTHCHECK curls :8000/health, which is right for that
+    # image's default gunicorn CMD and wrong for this one. Left enabled, this
+    # container is permanently "unhealthy" and Coolify reports the whole
+    # resource as degraded.
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # SINGLE REPLICA, always. Two beats means every price check runs twice.
+  beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    <<: *app-env
+    # --schedule is absolute on purpose. Beat persists its schedule to a
+    # shelve file and a relative path puts it in the working directory, /app,
+    # which the image's non-root user deliberately cannot write to.
+    command: ["celery", "-A", "app.workers.celery_app", "beat",
+              "--schedule", "/data/beat/celerybeat-schedule",
+              "--loglevel", "INFO"]
+    # Dockerfile.api's HEALTHCHECK curls :8000/health, which is right for that
+    # image's default gunicorn CMD and wrong for this one. Left enabled, this
+    # container is permanently "unhealthy" and Coolify reports the whole
+    # resource as degraded.
+    healthcheck:
+      disable: true
+    volumes:
+      - beatdata:/data/beat
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Nightly verified pg_dump.
+  #
+  # Built rather than bind-mounting ./docker/backup.sh the way the development
+  # stack does: Coolify keeps no repository on the host, so that mount source
+  # does not exist, and Docker silently creates an empty DIRECTORY in its place
+  # and mounts it over /backup.sh. See docker/Dockerfile.backup.
+  #
+  # The dumps go to an absolute host path, not a named volume and not the
+  # source tree: the point of this service is to survive both `down -v` and a
+  # redeploy, and Coolify rebuilds the application directory on every deploy.
+  backup:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backup
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in Coolify}
+    volumes:
+      - /data/hotel-price-monitor/backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
+  beatdata:
+  artifacts:

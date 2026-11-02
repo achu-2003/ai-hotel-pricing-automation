@@ -1,0 +1,933 @@
+# Runbook — first run and daily operation
+
+Written for a Windows 11 machine with the repository at
+`D:\CodeBase\hotel-price-monitor`.
+
+> **This machine runs natively, not in Docker.** Postgres, Redis, Python 3.12
+> and Chromium are already installed and working. To start it:
+>
+> ```powershell
+> .\scripts\dev-start.ps1
+> ```
+>
+> Jump to [Running without Docker](#running-without-docker-this-machines-setup)
+> for that setup. Sections 0-2 below describe the Docker path, which is what
+> production uses; sections 3-8 (creating an admin, configuring a hotel,
+> alerts) apply to both.
+
+---
+
+## 0. Install Docker Desktop (one time)
+
+Docker is not currently installed on this machine, and it is the only real
+prerequisite — Postgres, Redis, Chromium and the Python environment all live
+inside the containers.
+
+1. Download Docker Desktop for Windows:
+   <https://www.docker.com/products/docker-desktop/>
+2. Install it, accepting the **WSL 2** backend when prompted.
+3. Reboot if asked, then start Docker Desktop and wait for the whale icon in
+   the system tray to stop animating.
+4. Confirm:
+
+   ```powershell
+   docker --version
+   docker compose version
+   ```
+
+Both must print a version. If `docker` is "not recognised", Docker Desktop is
+not running or its CLI was not added to `PATH` — restart the app.
+
+> **Why Docker rather than installing things directly?** Redis has no
+> supported native Windows build, and the browser worker needs a specific set
+> of Chromium system libraries. Both are solved problems inside the images.
+
+---
+
+## 1. Check your `.env` — do not regenerate it
+
+`.env` **already exists** and already contains real generated secrets.
+
+```powershell
+Select-String -Path .env -Pattern "^ADMIN_USERNAME=|^ADMIN_PASSWORD="
+```
+
+Note both values — they are your first login.
+
+⚠️ **Do not re-run `scripts/bootstrap_env.py`.** It rewrites every secret,
+including `CREDENTIAL_KEK`. Regenerating that key makes any stored source
+credential permanently unreadable. Only run it on a machine with no `.env` yet.
+
+Back up `CREDENTIAL_KEK` somewhere **other than** your database backups. Stored
+alongside the database, it defeats the point of encrypting anything.
+
+---
+
+## 2. Start the stack
+
+```powershell
+docker compose up --build
+```
+
+First run pulls images and installs Playwright's Chromium — expect **5–15
+minutes**. Later runs take seconds.
+
+Startup order is enforced by the compose file: Postgres and Redis become
+healthy, then `migrate` runs `alembic upgrade head` once and exits, and only
+then do the API, workers and beat start. The API can therefore never come up
+against an out-of-date schema.
+
+**This is the first time the migration has ever run against a live
+PostgreSQL.** Watch for it in the log:
+
+```
+migrate-1  | INFO  [alembic.runtime.migration] Running upgrade  -> 0001, initial schema
+migrate-1 exited with code 0
+```
+
+`exited with code 0` is success. Anything else — stop and read the error
+before continuing.
+
+Leave this window running. It is your log stream. To run it in the background
+instead, use `docker compose up --build -d` and follow with
+`docker compose logs -f`.
+
+### Check it came up
+
+In a second PowerShell window:
+
+```powershell
+docker compose ps
+curl http://localhost:8000/health
+```
+
+Every service should be `running` (`migrate` will show `exited (0)`, which is
+correct). Health returns `{"status":"ok",...}`.
+
+| Service | URL |
+|---|---|
+| Dashboard | http://localhost:8000 |
+| API docs | http://localhost:8000/docs |
+| Flower (task monitor) | http://localhost:5555 |
+| Mailhog (catches all dev email) | http://localhost:8025 |
+
+---
+
+## 3. Create your administrator
+
+```powershell
+docker compose run --rm api python scripts/create_admin.py
+```
+
+It reads `ADMIN_USERNAME` / `ADMIN_PASSWORD` from `.env` and prints
+`Created administrator ...`.
+
+This is a deliberate one-off step rather than something the API does at
+start-up: two API replicas booting together would race to create the same
+user, and a "create an admin if none exists" path in a running web app is a
+privilege-escalation hole waiting for the day someone truncates the table.
+
+---
+
+## 4. Sign in
+
+Open <http://localhost:8000>, log in with the email and password from `.env`.
+
+You are redirected straight to **Change password** and cannot navigate
+anywhere else until you do. That password is also sitting in a plaintext file
+on disk, which is exactly why the change is forced.
+
+You should now see the Overview screen with every counter at zero. That is
+correct — nothing has been configured yet.
+
+---
+
+## 5. Configure the first hotel
+
+Nothing is collected until a source, a hotel and a monitor target exist. Do
+these in order; each step depends on the one before it.
+
+### 5a. Create a source, and record its ToS review
+
+A *source* is a place prices can be read from — one hotel's booking engine, an
+OTA, or manual entry.
+
+```powershell
+$body = @'
+{"code":"acme-direct","display_name":"Acme Resort booking engine",
+ "adapter_key":"playwright_direct_site","base_domain":"book.acmeresort.example",
+ "rate_limit_per_min":6}
+'@
+curl -X POST http://localhost:8000/api/v1/sources -H "Content-Type: application/json" -b cookies.txt -d $body
+```
+
+Easier: use the interactive docs at <http://localhost:8000/docs> — you are
+already logged in there via the session cookie, so `Try it out` just works.
+
+A source is created **disabled**. Enabling it requires a recorded Terms of
+Service review:
+
+```
+POST /api/v1/sources/{id}/tos-review
+{"reviewed_by": "Your Name", "approve": true, "notes": "Checked 2026-08-18"}
+```
+
+The dispatcher's query filters on `sources.tos_reviewed_at`, so a source with
+no review on file is *structurally* unfetchable — not merely discouraged. If a
+review comes back negative, record it with `"approve": false`: that documents
+the decision so nobody proposes the same source again in six months.
+
+### 5b. Add the hotel and attach the source
+
+- `POST /api/v1/hotels` — `{"name": "Acme Resort", "location": "Hilltown"}`
+- `POST /api/v1/hotels/{id}/sources` — attach the source, with the booking URL
+  and the `adapter_config` (see 5d).
+
+### 5c. Add room types
+
+`POST /api/v1/hotels/{id}/rooms` — `{"name": "Deluxe Room", "capacity": 2}`
+
+Add only the rooms you already know about. **You do not need to guess.**
+Anything the site lists that you have not mapped shows up under **Unmatched**,
+where you map it once and it resolves forever after. The system never guesses
+a room mapping: a wrong one corrupts a price series silently and indefinitely,
+while an unmatched row is a visible gap that gets fixed.
+
+### 5d. Where `adapter_config` comes from — run Phase 0 first
+
+**Do this before writing any adapter config.** The probe tells you which of
+your ~30 hotels are automatable at all, and at what quality:
+
+```powershell
+docker compose run --rm worker-browser python scripts/probe_site.py https://book.acmeresort.example/rooms
+```
+
+For each site it reports whether `robots.txt` permits us, whether a bot wall is
+present, **whether the site exposes a JSON availability endpoint** (the best
+outcome — JSON survives redesigns, CSS selectors do not), and what the prices
+and room names look like in the DOM. Results go to `docs/SOURCES.md`.
+
+A minimal DOM config, put on the hotel-source row:
+
+```json
+{
+  "url_template": "https://book.acmeresort.example/rooms?checkin={check_in}&checkout={check_out}&adults={adults}",
+  "room_card": ".room-result",
+  "selectors": {
+    "room_name": ".room-result__title",
+    "price": ".room-result__price",
+    "meal_plan": ".room-result__board"
+  },
+  "sold_out_markers": ["No rooms available"]
+}
+```
+
+If the probe found a JSON endpoint, prefer that shape instead — see the
+docstring at the top of `app/adapters/http_json.py`.
+
+`adapter_config` lives in the database precisely so a site redesign at 5 PM is
+a config edit that the next scheduled check picks up, not a code change and a
+deploy.
+
+### 5e. Create a monitor target
+
+```
+POST /api/v1/monitor-targets
+{"hotel_source_id": 1, "date_strategy": "rolling",
+ "lead_time_days": 7, "length_of_stay_nights": 1,
+ "adults": 2, "interval_minutes": 30}
+```
+
+A target says *which hotel, on which source, for which stay, how often*. It
+deliberately does not name rooms — the site decides what its rooms are called,
+and they are discovered by the fetch.
+
+---
+
+## 6. Prove it works
+
+On the hotel's page (or **Targets**), press **Run now**.
+
+The button returns immediately with a run id and polls for the result — a
+browser fetch takes 20–40 seconds, so an HTTP request must never block on one.
+Expect one of:
+
+| Result | Meaning |
+|---|---|
+| `N offers, M changes` | Working. First run reports 0 changes by design. |
+| `N offers, 0 changes, K unmatched` | Working; map the rooms under **Unmatched**. |
+| `failed` | Open **Health** → the error carries a screenshot and the HTML. |
+| `skipped — already running` | Normal. A previous run of the same hotel and stay window still held the lock. |
+
+**The first run never alerts anyone.** With no previous price there is no
+baseline, so nothing can have "changed" — otherwise adding a hotel would spam
+whoever is assigned to it.
+
+A confirmed change also needs to clear the significance threshold (₹50 *and*
+2% by default) and then persist across 2 consecutive checks. That debounce is
+what keeps the alerts worth reading.
+
+---
+
+## 7. Set up alerts
+
+1. `POST /api/v1/recipients` — name plus an email and/or an E.164 phone
+   (`+919876543210`).
+2. `POST /api/v1/hotels/{id}/recipients` — assign them, with channels and
+   their own sensitivity thresholds.
+3. On **Notifications**, press **Send test**. It calls the provider
+   synchronously and shows you the real verdict, because the point is to see
+   the failure now rather than discover it at the first real price move.
+
+In development, mail goes to Mailhog — open <http://localhost:8025> to read it.
+Nothing reaches a real inbox until `EMAIL_PROVIDER`/`SMTP_HOST` are pointed at
+a real relay.
+
+### WhatsApp
+
+Three providers, chosen with `WHATSAPP_PROVIDER`:
+
+| | `salesdaddy` | `meta_cloud` | `mydreams` |
+|---|---|---|---|
+| Who | Sales Daddy (`api.salesdaddy.in`) | Meta's Graph API directly | My Dreams Technology, a reseller |
+| Needs | one `sd_live_…` API key | a Meta app + system-user token | a licence number + API key |
+| Delivery receipts | yes — signed webhook | yes — delivered/read | **no** — stops at `sent` |
+| Template approval | required (Sales Daddy → Inbox → Templates) | required | required (via the reseller's panel) |
+
+**Since Sep 2026 the client's number sits on Sales Daddy.** My Dreams was
+disconnected and the same number reconnected there, so sends through the old
+licence were answered "Success" and never delivered. `salesdaddy` is the live
+path:
+
+```
+WHATSAPP_ENABLED=true
+WHATSAPP_PROVIDER=salesdaddy
+SALESDADDY_API_KEY=sd_live_…
+SALESDADDY_WEBHOOK_SECRET=<from Sales Daddy, for the status webhook>
+```
+
+Check the key before anything else — it names the number it sends from:
+
+```
+curl https://api.salesdaddy.in/v1/wa/account -H "X-Api-Key: sd_live_…"
+```
+
+For delivery receipts, give Sales Daddy `<PUBLIC_BASE_URL>/api/v1/webhooks/salesdaddy`.
+Template names are the same `WHATSAPP_TEMPLATE_NAME` /
+`WHATSAPP_COMPARISON_TEMPLATE_NAME`; they must be approved in Sales Daddy
+under exactly those names. The sections on `mydreams` below are history.
+
+Set up whichever one you are using — the template first, because
+**approval takes hours to days, so submit on day one.** Email needs no
+approval and works immediately.
+
+**1. Submit the template.** In the Meta WhatsApp Manager — or, on `mydreams`,
+through the reseller's own panel, since the licence owns the Meta account —
+create a template named exactly `price_change_alert`, category **Utility**,
+language **English** (`en`). Body, exactly this — seven variables, and the
+order is a contract with `app/notifications/render.py:_whatsapp_params`:
+
+```
+Rate update at {{1}}
+
+Room: {{2}}
+Was: {{3}}
+Now: {{4}}
+Change: {{5}}
+Stay: {{6}}
+
+Checked at {{7}}. Open the dashboard for the full list.
+```
+
+Sample values for the submission form: `Sunrise Resort` / `Deluxe Room` /
+`₹3,000` / `₹2,700` / `-₹300 (10.0%)` / `05 Sep 2026 → 06 Sep 2026` /
+`5:30 PM IST`.
+
+**Why prices lose their commas on `mydreams`.** A real message reads `₹12000`,
+not `₹12,000`. This is deliberate, not a formatting bug. The reseller passes
+all seven variables as one comma-joined string (`Param=a,b,c`) and splits on
+commas at the far end, so a comma inside a value — which Indian digit grouping
+puts in every rate above a thousand — shifts every later variable one slot
+left, and the alert then shows a real number against the wrong label with no
+error anywhere. URL-encoding does not help: `%2C` is decoded back before the
+split. `whatsapp_mydreams._param_safe` therefore drops grouping commas and
+turns any other comma into a semicolon. The Meta path keeps its grouping.
+If the reseller can confirm an escape or an alternate delimiter, that function
+is the one place to change and the grouping comes back.
+
+Three things that get templates rejected or silently unusable:
+
+- **Language code.** Meta's console also offers *English (US)* = `en_US`. Pick
+  that while `.env` says `WHATSAPP_TEMPLATE_LANG=en` and every send returns
+  132001 "template does not exist" — which looks exactly like "not approved
+  yet". This is the most common way this goes wrong.
+- **No header, footer, or buttons.** The provider sends only a `body`
+  component; a template expecting more is rejected with 132000.
+- **Do not shorten the labels.** Seven variables in a shorter body trips Meta's
+  "too many variables for the message length" check.
+
+"Rate update" rather than "Price change" because the same template also carries
+sold-out and available-again events.
+
+**1b. Submit the summary template too.** The two-hourly "what moved" message
+is a DIFFERENT approved template — `WHATSAPP_COMPARISON_TEMPLATE_NAME`, this
+deployment calls it `market_comparison_alert` — and until it exists the summary
+is refused rather than squeezed into the price-change template's slots. Five
+variables, category **Utility**, language to match `WHATSAPP_TEMPLATE_LANG`:
+
+```
+📊 *{{1}}*
+
+*What moved*
+
+▸ {{2}}
+
+▸ {{3}}
+
+▸ {{4}}
+
+🕒 Rates checked at {{5}}
+Open your dashboard for the full comparison table and the history behind every figure.
+```
+
+Sample values for the submission form:
+
+```
+{{1}} 4 rooms changed price in the last 2 hours
+{{2}} *COMPETITOR A* – ▲ Classic Room: ₹3030.48 → ₹3124.76 (Increase ₹94.28; 3.1%)
+{{3}} *Competitor B Resort* – ▼ Deluxe Double Room: ₹5775 → ₹5490 (Decrease ₹285; 4.9%)
+{{4}} Stay 12 Sep 2026 → 13 Sep 2026
+{{5}} 2:36 PM IST · prices excl. tax
+```
+
+Then `WHATSAPP_COMPARISON_TEMPLATE_PARAMS=5`, which must equal the number of
+variables approved: `render._summary_params` produces exactly that many and the
+provider refuses any other count before it spends a message.
+
+**Why three move slots and not five.** Two variables are fixed — the count and
+the stamp — and the rest are lines for the moves. Three quarters of the
+two-hour windows here move one, two or three rooms, so a template with more
+slots than that spends most evenings printing "—" under a single price. Three
+is the count at which `_spread` and `_context` can always fill the message:
+spare lines take the property's other rooms, then the stay, then "Nothing else
+moved in this window." A busier window packs several properties into one slot
+and says in the headline how many did not fit.
+
+**Change the body by submitting a NEW NAME, not by editing the live one.**
+Meta allows one edit per 24 hours on an active template and about ten a month;
+a second attempt is refused with
+
+    code 100, error_subcode 2388124
+    "You can only edit an active template once in 24 hours."
+
+and an edit that *is* accepted sends the template back to PENDING — so the
+summary stops going out until it clears review again. A new name
+(`market_comparison_alert_v2`) has neither problem: the approved template keeps
+sending while the replacement is reviewed, and the switch is two lines of
+`.env` — `WHATSAPP_COMPARISON_TEMPLATE_NAME` and
+`WHATSAPP_COMPARISON_TEMPLATE_PARAMS`, changed together, since a name and a
+variable count that disagree is error 132000 on every send. The name is
+configuration for exactly this reason.
+
+**A PARAMETER CAN CONTAIN A NEWLINE. Meta's documentation says otherwise.**
+It lists newlines, tabs and runs of spaces as rejected inside a template
+variable (132005), and both providers flattened every parameter on that basis
+for as long as this message existed — which is why the summary read as one
+run-on line per property. Measured against the live reseller endpoint on
+9 Sep 2026:
+
+```
+Param=...*Competitor A*%0A▲ Classic Room: ₹3218.36 → ₹3390%0A▼ ...
+-> {"ApiResponse":"Success", ... "message_status":"accepted"}   real wamid
+```
+
+and it arrived on the handset broken across the lines it asked for. `quote`
+writes the newline as `%0A` and the reseller's `rawurldecode` hands it back
+intact. So a slot is a **block** — `render._blocks` puts the property name on
+its own line with one room per line under it — and the template's blank lines
+separate one property from the next. Two properties sharing a slot are
+separated by `render._SEGMENT`, which is a blank line for the same reason.
+
+Do not re-flatten this in a provider. `whatsapp_cloud._clean` and
+`whatsapp_mydreams._param_safe` still collapse tabs and runs of spaces (those
+are on the same list and have NOT been measured, and nothing needs one), still
+refuse an empty value, and still handle the reseller's comma — but they leave
+newlines alone. Scraped text is flattened instead in `render._flat`, at the one
+point where a line break that means something can be told apart from one that
+came out of somebody's room table.
+
+**Every line has to fit forty characters, because a handset is forty
+characters wide.** WhatsApp Web is as wide as the window, so a sixty-character
+room line looks correct there and wraps on the phone -- and a wrapped
+continuation starts at column 0, where it reads as a line of its own and undoes
+the block. Indentation is not available to fix it: runs of spaces are collapsed
+before Meta sees them, measured alongside the newline. So `render._wa_room`
+gives each room two lines, the name and then the figures, and drops the
+spelled-out "Increase"/"Decrease" that the text and email bodies keep -- the
+arrow at the head of the name already says the direction, and the word is what
+pushed the figures line into a wrap. A room's tax-basis note rides on the name
+line for the same reason.
+
+**Formatting inside a variable works too.** `*asterisks*` render bold in a
+PARAMETER, not just in the template's own text — confirmed on the same path.
+That is what makes the first line of a block read as a heading. Padding with
+spaces does not work: they collapse.
+
+Slots the properties do not need go to `render._context`, whose lines belong to
+the window rather than to any one property and so read correctly across a gap.
+
+**2. Fill in `.env`.**
+
+Through the reseller (the live path):
+
+```
+WHATSAPP_ENABLED=true
+WHATSAPP_PROVIDER=mydreams
+MYDREAMS_LICENSE_NUMBER=<from the My Dreams API document>
+MYDREAMS_API_KEY=<from the My Dreams API document>
+```
+
+Both of those travel on the **query string**, so they land in every access log
+and reverse proxy in front of this app. The provider scrubs them out of its own
+logs and out of `notifications.error_detail`; nothing else may log the URL. If
+they leak, rotate them with the reseller — there is no scoping to fall back on,
+the key is full access to the licence.
+
+Direct to Meta:
+
+```
+WHATSAPP_ENABLED=true
+WHATSAPP_PROVIDER=meta_cloud
+WHATSAPP_PHONE_NUMBER_ID=<Meta > WhatsApp > API Setup>
+WHATSAPP_ACCESS_TOKEN=<a permanent system-user token, not the 24-hour test one>
+WHATSAPP_WEBHOOK_VERIFY_TOKEN=<any random string, also pasted into Meta>
+WHATSAPP_APP_SECRET=<Meta > App settings > Basic>
+```
+
+Check the licence is live before sending anything — this messages nobody:
+
+```powershell
+curl "https://wa.mydreamstechnology.in/api/accountvalidity.php?LicenseNumber=<licence>&APIKey=<key>"
+```
+
+**3. Restart the API and the worker.** `get_settings()` and
+`registry.get_provider()` are both `lru_cache`d, so nothing above takes effect
+in a running process. Until the **API** restarts the channel stays hidden on the
+Notifications page and assignment returns 409; until the **worker** restarts
+nothing sends.
+
+```powershell
+.\scripts\dev-stop.ps1 ; .\scripts\dev-start.ps1     # this machine
+docker compose up -d --force-recreate api worker-notify   # Docker
+```
+
+**4. Prove it before a price move depends on it.** On **Notifications**, press
+**Test whatsapp**. It calls Meta synchronously and shows the real error code, so
+a wrong token or an unapproved template is visible in seconds.
+
+**5. Switch it on for the hotels you already monitor:**
+
+```powershell
+.venv312\Scripts\python scripts\enable_whatsapp.py --list   # changes nothing
+.venv312\Scripts\python scripts\enable_whatsapp.py --all
+```
+
+This adds `whatsapp` alongside `email` — it never removes the email trail. Undo
+with `--all --off`.
+
+**6. Optional — delivery receipts. `meta_cloud` only.** Point Meta's webhook at
+`https://<host>/api/v1/webhooks/whatsapp`, subscribed to the `messages` field,
+using the verify token above. This is what turns "sent" into "delivered" and
+"read" in the dashboard. While `WHATSAPP_APP_SECRET` is empty the callback is
+accepted unsigned and warns on every call; once set, unsigned callbacks are
+rejected.
+
+**On `mydreams`, "sent" is weaker than it looks — verified against the live
+account.** Sending `Template=zzz_definitely_not_a_real_template_9876` returns:
+
+```
+{"ApiResponse":"Success","ApiMessage":"Message Received and Send to Meta"}
+```
+
+— byte-identical to a real template. The reseller validates nothing and
+reports success for receiving the request. Meta rejects it afterwards, out of
+sight. So a green `sent` row proves only that the reseller accepted the call;
+it is not evidence the message arrived, or that the template even exists.
+**When a message does not arrive, the reseller's panel is the only place the
+Meta rejection can be read.** Useful checks that send nothing:
+
+```powershell
+# Licence, credits and WhatsApp balance
+curl "https://wa.mydreamstechnology.in/api/accountvalidity.php?LicenseNumber=<licence>&APIKey=<key>"
+# Whether a 24-hour session window is open for one contact
+curl "https://wa.mydreamstechnology.in/api/conversationvalidity.php?LicenseNumber=<licence>&APIKey=<key>&Contact=91XXXXXXXXXX"
+```
+
+**On `mydreams`, a notification never leaves `sent`.** The reseller's API
+document lists no delivery callback, so "the reseller accepted it" is the last
+thing this system ever learns — a message that WhatsApp then failed to deliver
+looks identical to one that was read. Do not read `sent` as "it arrived", and
+do not build an alert on notifications being stuck there. Worth asking My
+Dreams whether they expose a callback that simply is not documented; if they
+do, it is a small addition next to the existing Meta webhook.
+
+**7. WhatsApp alert numbers.** The Alerts page has a panel taking up to five
+numbers that get **every price change on every hotel**, including hotels added
+later. Use it for "just WhatsApp me when anything moves"; use recipients and
+assignments for anything more selective.
+
+These are ordinary `recipients` rows carrying two flags, so they reuse the
+digest, the dedupe key and the delivery history:
+
+- `alerts_all_hotels` — resolved at dispatch, never written into
+  `hotel_recipients`. That is what covers a hotel created next month with no
+  backfill. A real assignment, if one exists, always wins over the synthesised
+  one, so a hand-set threshold is not overridden.
+- `bypass_throttle` — no quiet-hours hold, no per-recipient hourly cap. Digest
+  batching still applies, so one hotel's simultaneous moves stay one message.
+
+Clearing a row deactivates the recipient: it stops receiving immediately and
+its delivery history is kept. Re-entering the same number reuses the same row
+rather than forking a second one.
+
+**Each of these numbers is a billed WhatsApp message per change per hotel.**
+Five numbers across ten hotels on a busy repricing morning is five times the
+message volume of one — worth watching on the first bill.
+
+**Ops alerts stay on email.** "A hotel stopped being checked" cannot go through
+the price template — its seven variables are all about a room rate, so Meta
+answers 132000, which is permanent and never retried. Carrying those on WhatsApp
+would need a second approved template.
+
+---
+
+## 8. Leaving it running
+
+Once a target exists, Celery Beat fires `dispatch_due_checks` every 60 seconds
+and everything proceeds on its own. Useful commands:
+
+```powershell
+docker compose logs -f beat worker-browser   # watch the scheduler and fetches
+docker compose ps                            # what is up
+docker compose restart worker-browser        # after changing browser settings
+docker compose down                          # stop (data survives in volumes)
+docker compose down -v                       # stop AND delete all data
+```
+
+`docker compose down -v` destroys the price history. There is no undo — but
+see **Backups** below, which is what makes that sentence survivable.
+
+### Backups
+
+The `backup` service dumps the database to `./backups` every night at 02:30
+UTC, and once at start-up so a fresh deployment is covered immediately. Seven
+daily dumps are kept, plus four Sunday dumps on a weekly ladder.
+
+Each dump is read back with `pg_restore --list` before it replaces yesterday's,
+so a dump truncated by a restart or a full disk is discarded rather than kept
+under a valid-looking name.
+
+```powershell
+docker compose logs backup            # did last night's run succeed?
+ls backups/daily                      # what is on hand
+```
+
+**These live on this machine.** They survive `docker compose down -v`, a bad
+migration, and a wrong `DELETE`. They do not survive the machine dying. Copy
+`./backups` somewhere else on a schedule if the history matters more than the
+hardware — and keep `CREDENTIAL_KEK` somewhere different again, or a stolen
+backup arrives with its own keys.
+
+### Proving a backup would actually restore
+
+An untested backup is a guess. Run this monthly:
+
+```bash
+./scripts/restore_db.sh --verify
+```
+
+It restores the newest dump into a throwaway database, prints the row counts
+and the newest observation timestamp, and drops it again. The timestamp is the
+number that matters: it is how much history a real restore would give back.
+
+To recover for real:
+
+```bash
+./scripts/restore_db.sh --into hotelmonitor_recovered backups/daily/<file>.dump
+```
+
+Restoring over the live database needs `--force-into`, spelled differently on
+purpose.
+
+### What to watch
+
+Open the **Health** tab and look at **"Gone quiet"** before the error list. A
+target that stopped checking *without failing* produces no errors at all — the
+dashboard keeps showing yesterday's prices as though they were current. That
+silent case is the one that actually costs money; an erroring target is
+already visible.
+
+You should not have to remember to look. Two things push instead:
+
+**Ops alerts.** Tick *"Tell them when monitoring breaks"* on somebody's row on
+the **Alerts** page. `maintenance.alert_on_silence` then emails them when a
+target has missed three consecutive intervals, naming the hotel and how long it
+has been quiet. At most one message per person per day for the same set of
+stale targets — a new target going quiet does interrupt again. With nobody
+ticked, this system cannot tell you it has stopped working.
+
+**The dead-man's switch.** Set `HEARTBEAT_URL` to a ping URL from
+healthchecks.io or similar. Beat pings it every five minutes, but only after
+touching the database — a process that is alive with a dead database must not
+report itself healthy. The watchdog alerts when the pings stop, which is the
+only alarm that still works when this box is the thing that failed.
+
+### A hotel that is full is not a hotel that is broken
+
+A check whose page says "No available rooms on the selected dates" is a
+**success**, and shows on the run log as a grey `sold out` pill rather than
+`0 offers`. Hover it for the sentence: which night was full, and which night
+was priced instead.
+
+Because a last-minute window that comes back full also gets checked one night
+later — tonight rolls to tomorrow, tomorrow rolls to the night after, nothing
+further out moves. The prices found there are recorded against **that** night,
+never against the night that was asked for. Set `SOLD_OUT_ROLLOVER_DAYS=0` to
+turn the extra read off.
+
+If a run like this shows as `failed` with `parse_schema_drift` instead, the
+page is announcing its unavailability in wording the marker list has not seen.
+Add the phrase to `_SOLD_OUT_MARKERS` in `app/adapters/parsing.py` — one line,
+and every hotel on that engine benefits — rather than to one hotel's
+`sold_out_markers`. Keep it a phrase that *announces* unavailability: a marker
+that can appear in ordinary interface copy will report a hotel with rooms for
+sale as sold out, which is much the worse mistake.
+
+---
+
+## Development workflow
+
+`docker-compose.override.yml` is merged automatically by `docker compose up`,
+and it is what makes the stack usable while developing. It bind-mounts your
+source over the copy baked into the image and runs the API under
+`uvicorn --reload`.
+
+The base file bakes the source in on purpose — a deployed image should be a
+complete, immutable artifact. That is exactly wrong while developing, where
+every one-line edit would need a rebuild first.
+
+### The daily loop
+
+```powershell
+docker compose up              # start everything; leave it running
+```
+
+| You changed | What to do |
+|---|---|
+| Anything under `app/api/`, `app/dashboard/`, `app/templates/`, `app/schemas/` | **Nothing.** Save the file; uvicorn has already reloaded. |
+| A task, adapter, or `app/services/` file used by a worker | `docker compose restart worker-browser` (or `worker-http` / `worker-notify` / `beat`) |
+| `app/static/*.css` or `*.js` | Hard-refresh the browser — Ctrl+F5 |
+| `requirements.txt` | `docker compose up --build` |
+| A model, or anything under `alembic/` | `docker compose run --rm migrate alembic upgrade head` |
+
+Celery deliberately does not hot-reload: restarting a worker mid-fetch would
+abandon a live browser session. The restart is a second, not a rebuild,
+because the source is mounted.
+
+### Running the tests
+
+The unit suite needs no services at all and runs natively on Windows, which
+makes it far faster than going through a container:
+
+```powershell
+.venv\Scripts\python.exe -m pytest
+```
+
+257 tests, about five seconds. This is the tight loop — use it for anything in
+`app/services/`, `app/adapters/mapping.py`, `app/adapters/parsing.py` or
+`app/notifications/`, all of which are pure functions with no database.
+
+The integration suite needs the containers running. Postgres creates a
+separate `hotelmonitor_test` database on first boot precisely so a test run
+cannot destroy the prices you have been collecting:
+
+```powershell
+$env:TEST_DATABASE_URL="postgresql+psycopg://hotelmonitor_app:PASSWORD@localhost:5432/hotelmonitor_test"
+.venv\Scripts\python.exe -m pytest -m integration
+```
+
+Use the `POSTGRES_PASSWORD` from `.env`. If Postgres was first started before
+the init script existed, create the database by hand once:
+
+```powershell
+docker compose exec postgres psql -U hotelmonitor_app -d hotelmonitor -c "CREATE DATABASE hotelmonitor_test OWNER hotelmonitor_app;"
+```
+
+### Watching what happens
+
+```powershell
+docker compose logs -f api                 # requests
+docker compose logs -f beat worker-browser # the scheduler and the fetches
+```
+
+`LOG_LEVEL=DEBUG` is set for every service in the override file, and logs are
+rendered human-readably rather than as JSON whenever `APP_ENV=development`.
+
+Flower at <http://localhost:5555> shows queued, running and failed tasks —
+the fastest way to see whether a fetch was picked up at all.
+
+### Poking at the database
+
+```powershell
+docker compose exec postgres psql -U hotelmonitor_app -d hotelmonitor
+```
+
+Useful once prices exist:
+
+```sql
+SELECT h.name, r.name, s.last_price, s.is_available, s.last_checked_at
+FROM price_series s
+JOIN hotels h ON h.id = s.hotel_id
+JOIN room_types r ON r.id = s.room_type_id
+ORDER BY s.last_checked_at DESC LIMIT 20;
+```
+
+### One browser, not three
+
+The override sets the browser worker to concurrency 1. Three Chromiums at
+~400MB each is what makes an editor and your own browser feel slow on the same
+machine. Production uses 3.
+
+---
+
+## Troubleshooting
+
+**`docker: command not found`** — Docker Desktop is not installed or not
+running. See step 0.
+
+**`migrate` exits non-zero** — read its log:
+`docker compose logs migrate`. Nothing else will have started, so the database
+is in a known state; fix the error and re-run `docker compose up`.
+
+**`ports are not available: 8000`** — something else holds the port. Find it
+with `netstat -ano | findstr :8000`, or change the mapping in
+`docker-compose.yml`.
+
+**Dashboard loads but every count is zero** — expected until a source, hotel
+and target exist and one check has succeeded. Work through step 5.
+
+**A target shows `open` / paused** — five consecutive failures pause it for an
+hour; a robots.txt refusal or a bot wall pauses it immediately. Fix the cause,
+then press **Resume** on the Health tab, which also clears the failure counter.
+
+**Everything unmatched** — the adapter is reading room names the alias table
+does not know. That is the designed behaviour, not a bug. Map them once under
+**Unmatched**.
+
+**A fetch raises `SchemaDriftError`** — the page loaded but did not contain
+what the adapter expected, almost always a redesign. The error row carries a
+screenshot and the saved HTML; update `adapter_config` on the hotel-source
+row. No price is ever written from a guess.
+
+**A fetch raises `BlockedError` or `RobotsDisallowedError`** — the site has
+said no. There is no evasion path in this codebase by design. The circuit
+opens and the source needs a human decision, which may be "move this hotel to
+manual entry".
+
+---
+
+## Running without Docker (this machine's setup)
+
+Already done and working. Postgres and Redis run as **portable, user-level
+processes** out of `.local\` — no Windows service, no admin rights, nothing in
+the registry. Deleting `.local\` and `.venv312\` returns the machine to how it
+was.
+
+### Every day
+
+```powershell
+.\scripts\dev-start.ps1     # postgres, redis, api, worker, beat
+.\scripts\dev-stop.ps1      # stops all of it, keeps your data
+```
+
+`dev-start` is safe to re-run: it skips anything already listening, and ends by
+calling `/health/ready` so it reports whether the API can genuinely reach
+Postgres and Redis rather than just claiming it started something.
+
+### What is where
+
+| | |
+|---|---|
+| PostgreSQL 17.2 | `.local\pgsql\` (binaries), `.local\pgdata\` (your data) |
+| Redis 5.0.14 | `.local
+edis\`, data in `.local
+edis-data\` |
+| Python 3.12.10 + deps | `.venv312\` |
+| Chromium 131 | `%LOCALAPPDATA%\ms-playwright\` |
+| Logs | `.localpi.err.log`, `worker.err.log`, `beat.err.log`, `pg.log` |
+
+Python 3.12 specifically: `requirements.txt` cannot install on 3.14, which is
+what the system Python is. `rapidfuzz==3.11.0` has no 3.14 wheel and fails to
+build from source, and `psycopg-binary==3.2.3` has no 3.14 wheel at all.
+
+### Reloading after a change
+
+Nothing reloads on save. The API used to run under `uvicorn --reload`, but on
+Windows the restart it attempted never completed: the reloader logged
+"Reloading...", the old server kept answering, and the watcher stopped
+watching — so an edit looked applied and was not. After changing anything
+under `app\` — a route, a template, a task, an adapter — restart the stack:
+
+```powershell
+.\scripts\dev-stop.ps1 ; .\scripts\dev-start.ps1
+```
+
+### The one real limitation
+
+Celery runs with `--pool=solo` because its default prefork pool needs `fork()`,
+which Windows does not have. One task at a time: a 30-second browser fetch
+blocks the notify queue behind it. Fine for developing against one or two
+hotels, not enough for thirty on 30-minute intervals. Production on Linux uses
+prefork with real concurrency, which is the same code path either way.
+
+### Talking to the database directly
+
+```powershell
+$env:PGPASSWORD = (Select-String -Path .env -Pattern '^POSTGRES_PASSWORD=(.*)$').Matches.Groups[1].Value
+.\.local\pgsqlin\psql.exe -h 127.0.0.1 -U hotelmonitor_app -d hotelmonitor
+```
+
+### Integration tests
+
+The cluster already has a second database, `hotelmonitor_test`, so a test run
+cannot destroy collected prices:
+
+```powershell
+$env:TEST_DATABASE_URL="postgresql+psycopg://hotelmonitor_app:PASSWORD@127.0.0.1:5432/hotelmonitor_test"
+.venv312\Scripts\python.exe -m pytest -m integration
+```
+
+### Not available natively
+
+Mailhog is not installed, so `SMTP_HOST` still points at `mailhog` and test
+emails will fail to connect. Either leave it (notifications are a later phase)
+or set `EMAIL_PROVIDER=resend` with a real API key.
+
+---
+
+## If you later want Docker instead
+
+Possible but not recommended on Windows, and unnecessary for the pure-logic
+test suite, which needs no services at all:
+
+```powershell
+.venv\Scripts\python.exe -m pytest        # 257 tests, no database required
+```
+
+For the full stack you would need PostgreSQL 16 installed natively, a Redis
+substitute (Memurai, or Redis inside WSL2 — there is no supported native
+Windows build), `pip install -r requirements.txt`, `playwright install
+chromium`, and `POSTGRES_HOST`/`REDIS_HOST` changed from the Docker service
+names to `localhost`. Then run `alembic upgrade head`, `uvicorn app.main:app`,
+and each Celery worker and beat in its own terminal. Docker Desktop is less
+work.

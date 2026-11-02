@@ -1,0 +1,516 @@
+"""WhatsApp via My Dreams Technology, the reseller the client's number sits on.
+
+HOW THIS DIFFERS FROM ``whatsapp_cloud``
+=======================================
+Same channel, same approved template, almost nothing else in common. The
+reseller wraps Meta behind a handful of PHP endpoints:
+
+  * everything is a **GET**, including the send;
+  * credentials are ``LicenseNumber`` + ``APIKey`` **on the query string**;
+  * there is no phone-number id -- the licence fixes which number sends;
+  * there is no language code -- the template name alone selects the language;
+  * template variables arrive as ONE comma-joined string, ``Param=a,b,c``;
+  * **no delivery callback is documented**, so a send ends at "accepted" and
+    the DELIVERED/READ half of the notification lifecycle never fires.
+
+The business rule from Meta still applies underneath: a business-initiated
+message must use a pre-approved template, so this provider sends a template
+name plus positional parameters and never the rendered text.
+
+"SUCCESS" MEANS ALMOST NOTHING HERE — MEASURED, NOT ASSUMED
+===========================================================
+Sending a template name that cannot exist::
+
+    Template=zzz_definitely_not_a_real_template_9876
+    -> {"ApiResponse":"Success","ApiMessage":"Message Received and Send to Meta"}
+
+Byte-identical to the answer for a real one. The reseller validates nothing —
+not the template name, not the parameter count — and reports success for
+having received the HTTP request. The actual rejection happens at Meta,
+afterwards, and no callback exists to report it.
+
+So ``ok=True`` from this provider means "the reseller took it", and a
+notification reaching SENT is *not* evidence that anything arrived, or even
+that the template exists. Do not build a check on it, and do not read a run of
+successful sends as a working integration. ``_PERMANENT_MARKERS`` below is
+kept for the failures the reseller *can* report — a dead licence, a malformed
+request — but on current evidence it will rarely fire.
+
+When a message does not arrive, this provider cannot tell you why. The
+reseller's own panel holds the Meta delivery status; the API does not expose
+it.
+
+THE COMMA
+=========
+``Param`` is split on commas by the reseller, so a comma *inside* a value
+silently shifts every later variable into the wrong slot -- the alert then
+reports a real number against the wrong label, with no error anywhere. This is
+not an edge case: ``render.money`` uses Indian digit grouping, so every rate
+above a thousand carries one.
+
+    ₹12,000  ->  splits into "₹12" and "000"
+
+URL-encoding does not help. ``%2C`` is decoded back to a comma before the
+reseller splits on it, so the encoding round-trips and the field still breaks.
+The only defence is to ensure no parameter contains a comma in the first place,
+which is what ``_param_safe`` guarantees at a single chokepoint.
+
+It lives here rather than in ``render`` on purpose: this is a limitation of one
+transport, not a decision about what the message should say. The Meta path
+keeps its digit grouping.
+"""
+from __future__ import annotations
+
+import re
+from urllib.parse import quote
+
+import httpx
+
+from app.config import get_settings
+from app.core.logging import get_logger
+from app.notifications.base import (
+    Destination,
+    RenderedMessage,
+    SendResult,
+    whatsapp_template_for,
+)
+
+log = get_logger("notify.whatsapp.mydreams")
+
+_TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
+
+#: Substrings that mean "this will fail identically forever".
+#:
+#: The reseller reports failures as prose, not as Meta's numeric codes, so
+#: there is nothing to match on but the wording. Matching is done lowercased on
+#: the whole body. Anything not listed is treated as retryable, which is the
+#: safe direction: retrying a permanent failure wastes three attempts, while
+#: giving up on a transient one loses the alert.
+_PERMANENT_MARKERS = (
+    "invalid licensenumber",
+    "invalid apikey",
+    "invalid license",
+    "invalid api key",
+    "authentication failed",
+    "account expired",
+    "account is expired",
+    "licence expired",
+    "license expired",
+    "template not found",
+    "invalid template",
+    "template does not exist",
+    "not approved",
+    "invalid contact",
+    "invalid number",
+    "invalid mobile",
+    "not a whatsapp",
+    "parameter count",
+    "insufficient",
+)
+
+#: Substrings that mean the reseller took the message.
+#:
+#: Checked case-insensitively. Kept deliberately narrow -- anything that does
+#: not clearly say "sent" is treated as a failure rather than assumed good,
+#: because a lost price alert is invisible and an over-reported one is not.
+_SUCCESS_MARKERS = ("success", "submitted", "sent", "queued", "accepted", "ok")
+
+
+class MyDreamsWhatsAppProvider:
+    channel = "whatsapp"
+    provider_name = "mydreams"
+
+    def is_configured(self) -> bool:
+        settings = get_settings()
+        return bool(
+            settings.whatsapp_enabled
+            and settings.mydreams_license_number
+            and settings.mydreams_api_key
+            and settings.whatsapp_template_name
+        )
+
+    def send(self, destination: Destination, message: RenderedMessage) -> SendResult:
+        settings = get_settings()
+
+        if not self.is_configured():
+            return SendResult(
+                ok=False, error_code="not_configured",
+                error_detail="WhatsApp is not enabled or the My Dreams licence is missing",
+                retryable=False,
+            )
+        if not destination.phone_e164:
+            return SendResult(
+                ok=False, error_code="no_phone",
+                error_detail="Recipient has no E.164 phone number", retryable=False,
+            )
+
+        # Which approved template carries THIS message. Resolved through the
+        # same chokepoint as the Meta path, so the two transports cannot come
+        # to disagree about which template a comparison belongs in.
+        template, expected = whatsapp_template_for(message.kind, settings)
+        if not template:
+            log.warning("whatsapp_template_not_configured", kind=message.kind)
+            return SendResult(
+                ok=False,
+                error_code="template_not_configured",
+                error_detail=(
+                    f"No approved WhatsApp template is configured for "
+                    f"{message.kind!r} messages"
+                ),
+                retryable=False,
+            )
+
+        # Same contract as the Meta path, and refused for the same reason: the
+        # approved template has a fixed number of variables, so any other count
+        # is a message that is paid for and lands wrong. Reachable whenever a
+        # notification rebuilds with no price_change rows behind it.
+        #
+        # The reseller validates NEITHER -- it answers Success for a template
+        # that does not exist and for any parameter count at all (see the
+        # module docstring) -- so this check is the only thing standing between
+        # a drift here and a message that is accepted, charged for, and
+        # rejected silently at Meta with no callback to report it.
+        params = message.template_params or []
+        if len(params) != expected:
+            log.error(
+                "whatsapp_param_count_mismatch",
+                template=template,
+                expected=expected,
+                got=len(params),
+            )
+            return SendResult(
+                ok=False,
+                error_code="template_params",
+                error_detail=(
+                    f"Template {template!r} takes {expected} parameters, "
+                    f"got {len(params)}"
+                ),
+                retryable=False,
+            )
+
+        query = {
+            "LicenseNumber": settings.mydreams_license_number,
+            "APIKey": settings.mydreams_api_key.get_secret_value(),
+            # The reseller wants a bare country-code-prefixed number, as in
+            # 919876543210 -- the E.164 '+' is not accepted.
+            "Contact": destination.phone_e164.lstrip("+"),
+            "Template": template,
+            "Param": "",
+        }
+        # The whole message travels in a query string, so the limit that binds
+        # is the ENCODED length of one -- not the length of any parameter. See
+        # _fit_to_query_budget.
+        fixed = len(_encode(query))
+        safe = _fit_to_query_budget(
+            [_param_safe(p) for p in params], _MAX_QUERY_CHARS - fixed
+        )
+        if sum(map(len, safe)) < sum(len(_param_safe(p)) for p in params):
+            log.warning(
+                "whatsapp_params_trimmed_to_fit_url",
+                template=template,
+                budget=_MAX_QUERY_CHARS,
+            )
+        query["Param"] = ",".join(safe)
+
+        url = f"{settings.mydreams_base_url.rstrip('/')}/sendtemplate.php?{_encode(query)}"
+        try:
+            with httpx.Client(timeout=_TIMEOUT) as client:
+                response = client.get(url)
+        except httpx.HTTPError as exc:
+            # str(exc) on an httpx error can carry the full request URL, and
+            # the URL is where the API key is.
+            return SendResult(
+                ok=False, error_code="network",
+                error_detail=_scrub(str(exc))[:500], retryable=True,
+            )
+
+        return _classify(response)
+
+
+def _encode(query: dict[str, str]) -> str:
+    """Build the query string with %20 for a space, never '+'.
+
+    THE SPACE, WHICH IS THE COMMA'S TWIN
+    ====================================
+    ``httpx`` builds a query string with form encoding, which writes a space as
+    ``+``. Every HTTP client does; it is correct for a form body and it is what
+    ``urlencode`` has always done. The reseller then decodes with PHP's
+    ``rawurldecode``, which turns ``%XX`` back into bytes and leaves ``+``
+    exactly where it is.
+
+    So the space survived the wire and died on arrival, and every template
+    variable ever sent through here reached the handset mangled::
+
+        Rate update at HCG+MURMURING+NEST
+        Room: Villa+3+Bedroom+with+Living+Room++1+more
+        Checked at 10:25+AM+IST
+
+    Nothing reported it. The reseller answers Success, Meta accepts the
+    template, the message is delivered, and the defect is visible only to the
+    person reading the chat -- which is why it ran for the life of the
+    integration.
+
+    ``quote`` is ``rawurlencode``'s counterpart: it writes ``%20`` for a space,
+    which the reseller does decode. That it also encodes the joining commas as
+    ``%2C`` is harmless and already established -- the reseller decodes before
+    it splits, which is the very round-trip that makes ``%2C`` useless as an
+    escape and is documented in ``_param_safe``.
+    """
+    return "&".join(f"{key}={quote(str(value), safe='')}" for key, value in query.items())
+
+
+#: Ceiling on one parameter, matching the Meta path.
+#:
+#: The value that can realistically reach it is a room name, scraped off
+#: somebody else's page and therefore untrusted in length as much as content.
+_MAX_PARAM_CHARS = 700
+
+#: Ceiling on the whole query string, which is where the message actually goes.
+#:
+#: The reseller takes a GET and puts every parameter in the URL. IIS caps a
+#: query string at 2048 bytes by default and answers a request over it with a
+#: bare 404 -- no code, no message, an HTML error page that says "File or
+#: directory not found" and nothing about length. Seen on 9 Sep 2026 sending a
+#: 24-hour summary: four properties, sixteen rooms, and a 404 from an endpoint
+#: that had worked minutes earlier with less to say.
+#:
+#: 1800 leaves room under the 2048 for the fixed parameters and for a reseller
+#: or proxy with a tighter limit than IIS's default.
+_MAX_QUERY_CHARS = 1800
+
+#: A comma sitting between two digits, i.e. a thousands separator.
+_GROUPING_COMMA = re.compile(r"(?<=\d),(?=\d)")
+
+
+def _fit_to_query_budget(values: list[str], budget: int) -> list[str]:
+    """Shrink the longest parameters until the ENCODED join fits.
+
+    WHY ENCODED LENGTH, AND WHY A TOTAL
+    ===================================
+    ``_MAX_PARAM_CHARS`` bounds one parameter and nothing bounds their sum, so
+    five parameters each under the ceiling could still build a URL far past
+    what the endpoint accepts. And the length that counts is after
+    percent-encoding, which is not a small correction on this content: a rupee
+    sign is one character and nine bytes, a newline one and three. A summary
+    that reads as 1,200 characters goes down the wire as more than 4,000.
+
+    That is why this only started failing on 9 Sep. Parameters used to be
+    flattened to one line, so a property was a run-on sentence and the total
+    stayed under by accident. Laying a slot out as a block -- two lines per
+    room, a blank line between properties -- multiplied both the newlines and
+    the length, and the first busy window after that went over.
+
+    TRUNCATION RATHER THAN REFUSAL
+    ==============================
+    A message the reader can see most of beats a 404 they never hear about.
+    The parameter count is preserved exactly, because the reseller does not
+    check it and Meta rejects the send if it is wrong, and nothing is ever
+    emptied for the same reason: an empty variable is a permanent 132005.
+
+    The longest parameter is cut first, repeatedly, so a single runaway
+    property gives up its tail before a short one loses anything.
+    """
+    out = list(values)
+    while out and _encoded_len(",".join(out)) > budget:
+        longest = max(range(len(out)), key=lambda i: len(out[i]))
+        body = out[longest].rstrip("…").rstrip()
+        # Below this there is nothing left to say and cutting further only
+        # risks emptying the parameter, which is refused outright at Meta.
+        if len(body) <= 16:
+            break
+        body = body[: len(body) - max(24, len(body) // 8)].rstrip()
+        out[longest] = f"{body}…"
+    return out
+
+
+def _encoded_len(value: str) -> int:
+    """How long this is once it is in a URL, which is the only length that binds."""
+    return len(quote(value, safe=""))
+
+
+def _param_safe(value: object) -> str:
+    """One comma-free line, never empty, bounded.
+
+    The comma is the whole point -- see the module docstring. Two kinds occur
+    and they want different treatment, distinguishable because a grouping comma
+    always sits between two digits:
+
+        ₹1,23,456            -> ₹123456     (separator dropped)
+        Deluxe, Sea View     -> Deluxe; Sea View
+
+    Dropping the digit grouping is a real loss: ``render.money`` goes to some
+    trouble to write Indian rates the way an Indian reader expects, and this
+    undoes it for this transport only. It is still the right trade -- an
+    unglamorous ₹123456 says the true price, whereas ₹12 against the "old
+    price" label says a false one. If the reseller can confirm an escape or an
+    alternate delimiter, that belongs here and the grouping comes back.
+
+    Tabs and runs of spaces are collapsed as well -- Meta rejects those inside a
+    template variable regardless of who transports it.
+
+    NEWLINES ARE KEPT, AND THAT WAS MEASURED HERE
+    =============================================
+    Meta's documentation rejects them too, and this collapsed them for that
+    reason. Sent through this very endpoint on 9 Sep 2026, a parameter carrying
+    "\n" came back with a real wamid and arrived on the handset broken across
+    the lines it asked for -- ``quote`` writes it as %0A and the reseller's
+    ``rawurldecode`` hands it back intact. ``render`` lays a slot out as a
+    block on the strength of that, so flattening here would undo it.
+
+    Scraped text is flattened in ``render._flat``, where a newline that means
+    something can still be told from one that came out of somebody's markup.
+    """
+    text = "\n".join(" ".join(part.split()) for part in str(value).splitlines())
+    text = _GROUPING_COMMA.sub("", text)
+    text = text.replace(",", ";")
+    text = text.strip() or "—"
+    if len(text) <= _MAX_PARAM_CHARS:
+        return text
+    return text[: _MAX_PARAM_CHARS - 1] + "…"
+
+
+def _classify(response: httpx.Response) -> SendResult:
+    """Turn whatever came back into a verdict.
+
+    The reseller's response format is not in the API document, and wrappers of
+    this shape commonly answer 200 with an error in the body -- so status code
+    alone cannot be trusted, and neither can the presence of a body. Both JSON
+    and plain text are handled.
+
+    An unrecognised body is reported as a NON-retryable failure. That is
+    deliberate and it is the least-bad of three bad options: retrying might
+    send a real person the same alert repeatedly, and assuming success would
+    lose it silently. Failing loudly and once puts the row in the notification
+    list where an operator can see it and use the resend endpoint.
+    """
+    body = (response.text or "").strip()
+    lowered = body.lower()
+
+    # Structured errors first: if it is JSON and it names a status, believe it
+    # over any keyword that happens to appear elsewhere in the body.
+    payload = _safe_json(response)
+    if payload:
+        status_text = str(
+            payload.get("status") or payload.get("Status") or payload.get("result") or ""
+        ).lower()
+        detail = str(
+            payload.get("message")
+            or payload.get("Message")
+            or payload.get("description")
+            or body
+        )
+        message_id = _message_id(payload)
+        if status_text and any(m in status_text for m in _SUCCESS_MARKERS):
+            # "accepted_unverified", not "sent": the reseller answers Success
+            # for a template that does not exist, so this records what it said
+            # rather than what happened. See the module docstring.
+            log.info(
+                "whatsapp_accepted_unverified", provider="mydreams", message_id=message_id
+            )
+            return SendResult(ok=True, provider_message_id=message_id)
+        if status_text:
+            return SendResult(
+                ok=False,
+                error_code=str(payload.get("code") or status_text)[:100],
+                error_detail=_scrub(detail)[:500],
+                retryable=_retryable(response.status_code, lowered),
+            )
+
+    if response.status_code != 200:
+        return SendResult(
+            ok=False,
+            error_code=f"http_{response.status_code}",
+            error_detail=_scrub(body)[:500] or f"HTTP {response.status_code}",
+            retryable=_retryable(response.status_code, lowered),
+        )
+
+    # A permanent marker outranks a success word: "Template not found, message
+    # not sent" contains both, and it is not a success.
+    if any(marker in lowered for marker in _PERMANENT_MARKERS):
+        return SendResult(
+            ok=False, error_code="rejected",
+            error_detail=_scrub(body)[:500], retryable=False,
+        )
+    if any(marker in lowered for marker in _SUCCESS_MARKERS):
+        log.info("whatsapp_accepted", provider="mydreams", body=_scrub(body)[:200])
+        return SendResult(ok=True, provider_message_id=_message_id(payload))
+
+    log.error(
+        "whatsapp_unrecognised_response",
+        provider="mydreams",
+        status=response.status_code,
+        body=_scrub(body)[:500],
+    )
+    return SendResult(
+        ok=False,
+        error_code="unrecognised_response",
+        error_detail=(
+            "My Dreams returned a body this provider cannot classify, so the "
+            f"message may or may not have been sent: {_scrub(body)[:300]!r}"
+        ),
+        retryable=False,
+    )
+
+
+def _retryable(status_code: int, lowered_body: str) -> bool:
+    if any(marker in lowered_body for marker in _PERMANENT_MARKERS):
+        return False
+    return status_code == 429 or status_code >= 500 or status_code == 408
+
+
+def _message_id(payload: dict) -> str | None:
+    """Meta's ``wamid``, wherever this reseller happened to put it.
+
+    It puts it one level down. The success body is Meta's own /messages
+    response wrapped in the reseller's envelope::
+
+        {"ApiResponse": "Success",
+         "ApiMessage": {"messaging_product": "whatsapp",
+                        "contacts": [{"wa_id": "91..."}],
+                        "messages": [{"id": "wamid.HBg..."}]}}
+
+    Reading only the top level found nothing, so every row stored
+    ``provider_message_id = NULL``. That is the id the reseller's panel is
+    keyed on, and the panel is the ONLY place a delivery failure appears --
+    there is no callback on this transport. Without it, "did that alert
+    arrive?" could not be answered for any message ever sent, and a run of
+    messages Meta accepted and then dropped for pacing (error 131049) looked
+    from here like a working integration.
+
+    ``ApiMessage`` is a plain string on some responses, hence the isinstance.
+    """
+    for key in ("messageid", "message_id", "msgid", "id", "MessageId", "MessageID"):
+        value = payload.get(key)
+        if value:
+            return str(value)[:255]
+
+    envelope = payload.get("ApiMessage") or payload.get("apimessage")
+    if isinstance(envelope, dict):
+        messages = envelope.get("messages")
+        if isinstance(messages, list) and messages:
+            first = messages[0]
+            if isinstance(first, dict) and first.get("id"):
+                return str(first["id"])[:255]
+    return None
+
+
+def _safe_json(response: httpx.Response) -> dict:
+    try:
+        data = response.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+#: Matches the two credential parameters anywhere in a string.
+_SECRET_IN_URL = re.compile(r"(APIKey|LicenseNumber)=[^&\s]*", re.IGNORECASE)
+
+
+def _scrub(text: str) -> str:
+    """Strip credentials out of anything heading for a log or the database.
+
+    The reseller authenticates on the query string, so the API key is present
+    in the request URL -- and therefore in httpx's exception messages, which
+    otherwise land verbatim in ``notifications.error_detail`` and in Sentry.
+    """
+    return _SECRET_IN_URL.sub(r"\1=***", text)

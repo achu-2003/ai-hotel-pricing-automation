@@ -1,0 +1,3281 @@
+"""Server-rendered dashboard.
+
+Jinja2 templates, rendered from the same async session the API uses. There is
+no JavaScript framework and no build step: the whole thing is 20 screens over
+a database, and a server-rendered page load is both faster to write and faster
+to open than anything that would need bundling.
+
+AUTH DIFFERS FROM THE API ON PURPOSE
+====================================
+The API returns 401 with a problem document. A browser hitting a page it is
+not logged into should be sent to the login form instead — a raw JSON 401 in a
+tab is a dead end. Same session cookie, same token, different failure mode.
+
+MUTATIONS GO THROUGH THE API
+============================
+Every form here posts to ``/api/v1/...`` rather than to a parallel set of
+dashboard handlers. One implementation of "create a hotel" means the
+validation, the audit trail and the authorisation rules cannot drift between
+the two entry points.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
+from io import BytesIO
+from pathlib import Path
+from typing import Annotated
+from zoneinfo import ZoneInfo
+
+from types import SimpleNamespace
+
+import jwt
+from fastapi import APIRouter, Cookie, Depends, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.templating import Jinja2Templates
+from annotated_types import Ge, Le
+from pydantic import BeforeValidator
+from sqlalchemy import ARRAY, BigInteger, func, or_, select
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.exc import ProgrammingError
+
+from app.adapters.engines import known_engines
+from app.api.deps import SESSION_COOKIE, DbSession
+from app.config import get_settings
+from app.core.logging import get_logger
+from app.core.security import decode_token
+from app.db.models import (
+    AlertDefaults,
+    ChangeDirection,
+    CheckRun,
+    CheckRunStatus,
+    CircuitState,
+    Hotel,
+    HotelRecipient,
+    HotelSource,
+    MonitoringError,
+    MonitorTarget,
+    Notification,
+    PriceChange,
+    PriceObservation,
+    PriceSeries,
+    RateApplication,
+    Recipient,
+    RepricingAction,
+    RepricingAdvice,
+    RepricingSettings,
+    RmsRoomMapping,
+    RoomType,
+    Source,
+    UnmatchedOffer,
+    User,
+)
+from app.db.models.price import SUPPRESSION_LABELS
+from app.notifications import registry
+from app.schemas.notifications import MAX_ALERT_NUMBERS
+from app.notifications.render import money
+from app.services import comparison_links
+from app.services import monitoring as monitoring_service
+from app.services import rate_gap
+from app.services import repricing as repricing_rule
+from app.services import repricing_data
+from app.services import room_moves
+from app.services import retention
+from app.services.dates import local_today, next_weekend
+from app.services.ownership import owned_hotel_ids, owns, scope_hotels
+from app.services.price_display import cheapest as cheapest_shown
+from app.services.price_display import (
+    Shown, displayed_price, displayed_price_sql, entry_offers, entry_rows,
+    is_on_asked_basis_sql,
+)
+from app.services.room_category import CATEGORIES, classify, is_category, label_for
+
+router = APIRouter(include_in_schema=False)
+
+
+def _blank_as_none(value: object) -> object:
+    """Read an empty query parameter as "not given".
+
+    A browser GET form submits every control it has, including the ones left
+    empty: "All hotels" is ``<option value="">``, and a cleared ``<input
+    type=date>`` sends the empty string. So pressing Filter produces
+    ``/changes?hotel_id=&date_from=&date_to=`` — and an ``int | None``
+    annotation rejects ``""`` with a 422, which reaches the person as a wall of
+    JSON where their unfiltered page should be. They are shown an error for
+    using the control the page gave them.
+
+    Fixed here rather than by stripping blanks in JavaScript before submit: the
+    query string is also something people type, edit, bookmark and share, and a
+    URL that only works when a script rewrote it first is a trap. A plain form
+    cannot omit a field, so the server has to accept what forms actually send.
+    """
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+#: Optional query parameters that a browser form may legitimately submit as "".
+#:
+#: Where there is a bound, it goes INSIDE the optional and the blank-coercion
+#: outside it. That reads backwards and is the only arrangement that works:
+#: ``ge`` applied to an ``int | None`` is eventually handed the None and raises
+#: ``'>=' not supported between instances of 'NoneType' and 'int'`` — which
+#: surfaces as a 500, or as a 422 blaming the caller for a comparison the
+#: framework could not make. Nesting keeps the bound on the int alone.
+BlankableInt = Annotated[int | None, BeforeValidator(_blank_as_none)]
+BlankableDate = Annotated[date | None, BeforeValidator(_blank_as_none)]
+BlankableAdults = Annotated[
+    Annotated[int, Ge(1), Le(20)] | None, BeforeValidator(_blank_as_none)
+]
+BlankableRowId = Annotated[
+    Annotated[int, Ge(0)] | None, BeforeValidator(_blank_as_none)
+]
+log = get_logger("dashboard")
+
+templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
+# Available in every template: prices are shown in Indian grouping everywhere,
+# and reimplementing that in Jinja would be a second place to get it wrong.
+templates.env.globals["money"] = money
+templates.env.globals["now"] = lambda: datetime.now(UTC)
+
+
+def _asset_version(name: str) -> str:
+    """A stylesheet's modification time, for the URL that requests it.
+
+    WHY A VERSION AND NOT JUST A PATH
+    =================================
+    /static/app.css never changed its address, so a browser holding yesterday's
+    copy had no way to learn there was a new one short of being told to
+    revalidate. A fixed layout was corrected, deployed, and reported still
+    broken three times over -- the file on disk right, the file on screen
+    stale, and no way to tell those apart by looking at the page.
+
+    The mtime is read on every render rather than cached at import: the whole
+    point is to notice a file that changed underneath a running process, and a
+    value captured at startup would go stale exactly when it mattered. It is
+    one stat() per page against a local file, next to a database round trip.
+
+    Falls back to a constant if the file cannot be read, which loses cache
+    busting rather than the page.
+    """
+    try:
+        return str(int((STATIC_DIR / name).stat().st_mtime))
+    except OSError:  # pragma: no cover - a missing asset is the mount's problem
+        return "0"
+
+
+STATIC_DIR = Path(__file__).parent.parent / "static"
+templates.env.globals["asset_version"] = _asset_version
+
+
+def _localtime(value, fmt: str = "%d %b %H:%M") -> str:
+    """Render a timestamp in the deployment's timezone, not UTC.
+
+    Everything is stored timezone-aware in UTC, which is correct. Showing it
+    that way is not: this system watches hotels in Tamil Nadu, and a Health tab
+    reporting a failure at 09:05 when the operator's clock says 14:35 makes
+    every incident harder to place. Rendering server-side in the configured
+    zone also means the same string appears in the dashboard and in an alert
+    email, rather than the two disagreeing.
+    """
+    if value is None:
+        return "—"
+    # A plain time (quiet hours) is already expressed in the recipient's own
+    # zone and has no date to convert against, so it is rendered as-is.
+    if not isinstance(value, datetime):
+        return value.strftime(fmt)
+    zone = ZoneInfo(get_settings().timezone)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(zone).strftime(fmt)
+
+
+templates.env.filters["localtime"] = _localtime
+templates.env.globals["tz"] = get_settings().timezone
+
+
+class NotLoggedIn(Exception):
+    """Raised by the dependency, converted to a redirect by the route."""
+
+
+async def dashboard_user(
+    session: DbSession,
+    hpm_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> User | None:
+    """Resolve the logged-in user, or ``None``.
+
+    Returns ``None`` rather than raising so each route can decide between a
+    redirect and a public render — the login page itself needs the same
+    dependency without being locked out by it.
+    """
+    if not hpm_session:
+        return None
+    try:
+        payload = decode_token(hpm_session)
+        # A SESSION IS ONE KIND OF TOKEN, NOT ANY TOKEN THIS KEY SIGNED.
+        #
+        # This used to accept whatever decoded and load ``sub`` as a user id,
+        # which was safe only while access tokens were the sole thing signed
+        # with the secret. The moment a second kind exists, anything carrying a
+        # user id in ``sub`` is a login here for whoever holds it -- pasted
+        # into this cookie, a link meant to open one read-only page would open
+        # the whole dashboard as its owner.
+        #
+        # Checked rather than left to the sharing code to avoid ``sub``,
+        # because that is a rule every future token would have to remember and
+        # this is a rule none of them can break. Existing cookies already carry
+        # typ=access, so nobody is signed out by this arriving.
+        if payload.get("typ") != "access":
+            return None
+        user = await session.get(User, int(payload.get("sub", 0)))
+    except (jwt.PyJWTError, TypeError, ValueError):
+        return None
+    return user if user and user.is_active else None
+
+
+DashUser = Annotated[User | None, Depends(dashboard_user)]
+
+
+def _redirect_to_login(request: Request) -> RedirectResponse:
+    """Send the browser to the login form, remembering where it was going."""
+    return RedirectResponse(
+        url=f"/login?next={request.url.path}", status_code=303
+    )
+
+
+async def _render(
+    request: Request, user: User, session, template: str, **context
+) -> HTMLResponse:
+    """Render a page, with the "needs attention" count every screen shows.
+
+    Computed centrally rather than per route: a nav badge that some pages
+    forget to populate is worse than none, because it silently reads zero.
+    Four cheap counts, and they are the only things that ever require a human.
+    """
+    now = datetime.now(UTC)
+    # Scoped like every page it appears on. A badge counting the whole
+    # deployment would send someone to an Attention page that then showed
+    # them nothing -- a permanent unread marker they have no way to clear.
+    mine = owned_hotel_ids(user)
+    targets = (
+        await session.scalars(
+            select(MonitorTarget)
+            .join(HotelSource, MonitorTarget.hotel_source_id == HotelSource.id)
+            .where(MonitorTarget.is_enabled.is_(True), HotelSource.hotel_id.in_(mine))
+        )
+    ).all()
+    attention = {
+        # Counted by the same rule the Attention page lists by, so the badge
+        # never promises a row the page then hides.
+        "errors": sum(
+            1 for error, target in await _open_errors(session, mine)
+            if monitoring_service.needs_a_person(error, target, now)
+        ),
+        "unmatched": await session.scalar(
+            select(func.count(UnmatchedOffer.id))
+            .join(HotelSource, UnmatchedOffer.hotel_source_id == HotelSource.id)
+            .where(UnmatchedOffer.resolved_at.is_(None), HotelSource.hotel_id.in_(mine))
+        ) or 0,
+        "stale": sum(1 for t in targets if t.is_stale(now)),
+        "paused": sum(1 for t in targets if t.circuit_state != CircuitState.CLOSED),
+    }
+    attention["total"] = sum(attention.values())
+
+    return templates.TemplateResponse(
+        request=request,
+        name=template,
+        context={
+            "user": user,
+            "is_admin": user.role.value == "admin",
+            "attention": attention,
+            **context,
+        },
+    )
+
+
+# -- login -----------------------------------------------------------
+
+#: How far behind the newest row a series may be before it is read as absent
+#: rather than merely checked on a different schedule.
+UNLISTED_AFTER = timedelta(minutes=15)
+
+
+def unlisted_offer_keys(
+    series_rows, *, tolerance: timedelta = UNLISTED_AFTER
+) -> set[str]:
+    """Rooms the source has stopped listing, among rooms shown as unavailable.
+
+    A room the hotel declares sold out and a room that has vanished from the
+    page are both ``is_available=false``, and both used to render as "sold out
+    - Last checked 11:22" with a clock that receded further every day. They
+    call for different responses. One is inventory doing its job. The other is
+    a room nothing is looking at any more, and a stale timestamp beside it
+    reads as monitoring having broken.
+
+    The signal is already in the table. Once absence is confirmed the series is
+    marked unavailable, and the absence sweep only considers AVAILABLE series
+    -- which is what stops it oscillating -- so the row is never touched again
+    and its ``last_checked_at`` stops while its neighbours move on. Being
+    behind the newest row is therefore exactly "was not in the most recent
+    fetch".
+
+    Two things keep it from over-claiming. The tolerance, because targets for
+    the same night at different occupancies are separate page loads minutes
+    apart and none of that is a room going missing. And the restriction to rows
+    already shown as unavailable, which bounds the worst case: a wrong guess
+    relabels a sold-out room. It can never invent one, and never touches a room
+    that is on sale.
+    """
+    checked = [s.last_checked_at for s in series_rows if s.last_checked_at is not None]
+    if not checked:
+        return set()
+    newest = max(checked)
+    return {
+        s.offer_key
+        for s in series_rows
+        if not s.is_available
+        and s.last_checked_at is not None
+        and s.last_checked_at < newest - tolerance
+    }
+
+
+@router.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, user: DashUser, next: str = "/"):
+    if user is not None:
+        return RedirectResponse(url=next or "/", status_code=303)
+    return templates.TemplateResponse(
+        request=request, name="login.html", context={"next": next}
+    )
+
+
+@router.get("/logout")
+async def logout_page():
+    response = RedirectResponse(url="/login", status_code=303)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@router.get("/change-password", response_class=HTMLResponse)
+async def change_password_page(request: Request, user: DashUser):
+    """Where the middleware sends anyone with an outstanding password change.
+
+    Reachable while the change is outstanding, unlike every other page — and
+    the account was created with a password that is also sitting in a .env
+    file, which is exactly why the change is forced.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="change_password.html",
+        context={"user": user, "is_admin": user.role.value == "admin",
+                 "forced": user.must_change_password},
+    )
+
+
+# -- overview --------------------------------------------------------
+@router.get("/", response_class=HTMLResponse)
+async def overview(request: Request, user: DashUser, session: DbSession):
+    """The screen someone opens first: what changed, and what is broken."""
+    if user is None:
+        return _redirect_to_login(request)
+
+    now = datetime.now(UTC)
+    day_ago = now - timedelta(hours=24)
+
+    recent_changes = (
+        await session.execute(
+            select(PriceChange, Hotel.name, RoomType.name)
+            .join(Hotel, PriceChange.hotel_id == Hotel.id)
+            .outerjoin(PriceSeries, PriceChange.offer_key == PriceSeries.offer_key)
+            .outerjoin(RoomType, PriceSeries.room_type_id == RoomType.id)
+            .where(PriceChange.changed_at >= day_ago, Hotel.owner_user_id == user.id)
+            .order_by(PriceChange.changed_at.desc())
+            .limit(20)
+        )
+    ).all()
+
+
+    mine = owned_hotel_ids(user)
+
+    last_success = await session.scalar(
+        select(func.max(MonitorTarget.last_success_at))
+        .join(HotelSource, MonitorTarget.hotel_source_id == HotelSource.id)
+        .where(HotelSource.hotel_id.in_(mine))
+    )
+    summary = {
+        "hotels_active": await session.scalar(
+            select(func.count(Hotel.id)).where(
+                Hotel.is_active.is_(True), Hotel.owner_user_id == user.id
+            )
+        ),
+        "changes_24h": await session.scalar(
+            select(func.count(PriceChange.id)).where(
+                PriceChange.changed_at >= day_ago, PriceChange.hotel_id.in_(mine)
+            )
+        ),
+        # Rendered here rather than in the template so it uses the same
+        # timezone conversion as every other timestamp on the page.
+        "last_check": _localtime(last_success, "%d %b %H:%M") if last_success else None,
+        "last_check_ago": _ago(last_success, now),
+    }
+
+    # Split the 24h count by direction. "5 changes" and "5 increases" are
+    # different news to someone deciding whether to reprice.
+    summary["increases_24h"] = await session.scalar(
+        select(func.count(PriceChange.id)).where(
+            PriceChange.changed_at >= day_ago,
+            PriceChange.direction == ChangeDirection.INCREASE,
+            PriceChange.hotel_id.in_(mine),
+        )
+    )
+
+    hotels = await _tonight_by_hotel(session, now, user)
+    summary["rooms_today"] = sum(h["rooms"] for h in hotels)
+
+    return await _render(
+        request, user, session, "overview.html",
+        summary=summary,
+        changes=recent_changes,
+        hotels=hotels,
+        show_with_tax=await _show_prices_with_tax(session),
+        flat_move=_flat_move(recent_changes),
+        max_pct=max((abs(c.delta_pct or 0) for c, _, _ in recent_changes), default=0) or 1,
+    )
+
+
+def _ago(moment: datetime | None, now: datetime) -> str | None:
+    """"18 minutes ago" — the form that answers "are these prices current?".
+
+    A clock time alone makes the reader do the subtraction, and the whole
+    question this tile exists for is how long ago, not when.
+    """
+    if moment is None:
+        return None
+    minutes = int((now - moment).total_seconds() // 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} ago"
+    hours, rest = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {rest:02d}m ago"
+    return f"{hours // 24}d ago"
+
+
+def _flat_move(changes) -> dict | None:
+    """A move of the IDENTICAL rupee amount across differently-priced rooms.
+
+    Rooms priced from 1,000 to 3,600 do not all rise by exactly 81.25 because
+    a hotel repriced them; that is a per-booking fee or levy folded into the
+    rate. The table shows five separate rows and hides the one fact that
+    explains all of them, so it is stated once, above the noise.
+    """
+    priced = [c for c, _, _ in changes if c.delta is not None and c.delta != 0]
+    if len(priced) < 3:
+        return None
+    deltas = {c.delta for c in priced}
+    if len(deltas) != 1:
+        return None
+    hotels = {c.hotel_id for c in priced}
+    if len(hotels) != 1:
+        return None
+    return {"delta": priced[0].delta, "currency": priced[0].currency, "rooms": len(priced)}
+
+
+async def _tonight_by_hotel(session, now: datetime, user) -> list[dict]:
+    """One card per hotel: how many rooms, how cheap, how fresh, and whether
+    the freshness can be trusted.
+
+    A hotel with prices on screen and no successful check behind them is the
+    failure this page exists to make visible, so the status is derived from
+    the check rather than from the presence of rows.
+    """
+    settings = get_settings()
+    today = local_today(settings.timezone)
+    show_with_tax = await _show_prices_with_tax(session)
+
+    rows = (
+        await session.execute(
+            select(
+                Hotel.id,
+                Hotel.name,
+                func.count(PriceSeries.offer_key),
+                # The same fallback order the room cells use, in SQL because
+                # this one is a MIN() over every room. Both forms live in
+                # services/price_display.py and a test holds them together.
+                func.min(displayed_price_sql(show_with_tax)),
+                # Whether EVERY room behind that figure carries the component
+                # the switch asked for. Only then may the card say so -- see
+                # is_on_asked_basis_sql for the label that lied.
+                func.bool_and(is_on_asked_basis_sql(show_with_tax)),
+                func.max(PriceSeries.last_checked_at),
+            )
+            .join(
+                PriceSeries,
+                (PriceSeries.hotel_id == Hotel.id) & (PriceSeries.check_in == today),
+                isouter=True,
+            )
+            .where(Hotel.is_active.is_(True), Hotel.owner_user_id == user.id)
+            .group_by(Hotel.id, Hotel.name)
+            .order_by(Hotel.name)
+        )
+    ).all()
+
+    # Standing-rate sources quote one price regardless of date. Their rows are
+    # correct but they are not tracking nightly movement, and a card that said
+    # "Live" would overstate what is being watched.
+    standing = {
+        hotel_id
+        for hotel_id, config in (
+            await session.execute(
+                select(HotelSource.hotel_id, HotelSource.adapter_config)
+                .where(HotelSource.hotel_id.in_(owned_hotel_ids(user)))
+            )
+        ).all()
+        if (config or {}).get("standing_rate")
+    }
+
+    # Staleness is decided by the same rule the silence alarm uses -- no
+    # success in three intervals -- rather than a second threshold invented
+    # here. Two definitions of "stale" that disagree is how a hotel ends up
+    # green on one screen and red on another.
+    quiet = {
+        hotel_id
+        for hotel_id, target in (
+            await session.execute(
+                select(HotelSource.hotel_id, MonitorTarget).join(
+                    MonitorTarget, MonitorTarget.hotel_source_id == HotelSource.id
+                ).where(
+                    MonitorTarget.is_enabled.is_(True),
+                    HotelSource.hotel_id.in_(owned_hotel_ids(user)),
+                )
+            )
+        ).all()
+        if target.is_stale(now)
+    }
+
+    out = []
+    for hotel_id, name, rooms, cheapest, on_basis, checked in rows:
+        if not rooms:
+            status, tone = "No prices", "bad"
+        elif hotel_id in quiet:
+            status, tone = "Gone quiet", "warn"
+        elif hotel_id in standing:
+            status, tone = "Today only", "warn"
+        else:
+            status, tone = "Live", "ok"
+        out.append({
+            "id": hotel_id,
+            "name": name,
+            "rooms": rooms or 0,
+            "cheapest": cheapest,
+            # bool_and over no rows is NULL, which is neither true nor a claim.
+            "on_basis": bool(on_basis),
+            "checked": _localtime(checked, "%H:%M") if checked else None,
+            "status": status,
+            "tone": tone,
+            "standing": hotel_id in standing,
+        })
+    return out
+
+
+async def _show_prices_with_tax(session) -> bool:
+    """Whether displayed prices carry tax, deployment-wide.
+
+    One row, read per request. Not cached the way the worker caches the
+    thresholds beside it: this decides what is on the screen the operator is
+    looking at, and a switch that takes a minute to appear reads as a switch
+    that did not work. The read is a primary-key get on a single-row table.
+
+    Missing row -- the window between deploying this and running its migration
+    -- means off, which is what every screen showed yesterday.
+    """
+    row = await session.get(AlertDefaults, 1)
+    return bool(row is not None and row.show_prices_with_tax)
+
+
+# -- price matrix ----------------------------------------------------
+async def _default_night(session, user, adults: int) -> tuple[date, date, str]:
+    """The night the comparison screen opens on, and the sentence saying why.
+
+    TONIGHT FIRST. Everything below is what to do when tonight has no prices
+    yet; while it has any, tonight is the answer, because that is the night
+    Repricing is about and two screens disagreeing about which night they
+    show is worse than either choice of default.
+
+    A NIGHT ONE HOTEL HAS IS NOT A NIGHT WORTH COMPARING
+    ====================================================
+    This used to be ``MAX(check_in)`` over everything collected, which is the
+    right answer only while every hotel is priced for the same nights. It is
+    not, and the exception is a feature: when a hotel is sold out for the
+    night that was asked for, the fetcher rolls forward and prices the NEXT
+    night too, filed under its own dates (see ``_with_rollover`` in
+    app/workers/tasks_fetch.py).
+
+    That roll-forward night is then the newest ``check_in`` in the table, and
+    it belongs to the one hotel that happened to be full. On 4 Sep the matrix
+    opened on 5 Sep and showed a single property -- Competitor A, the only hotel
+    with no rooms for tonight -- while the ten hotels priced for tonight, the
+    comparison the page exists to make, sat one date-picker click away with
+    nothing on the page to suggest it.
+
+    So the default is the most recent night that was actually MONITORED: a
+    night some check run for one of this account's hotels asked about. A
+    rolled night was never asked about by anybody, so it stops being the
+    default while staying perfectly reachable by typing the date.
+
+    Deliberately not "the night with the most hotels on it". A hotel whose
+    fetch failed this morning would drop today below yesterday's count and
+    swing the whole page back a day -- stale prices, presented as current,
+    because one property was briefly unreachable.
+    """
+    owned = owned_hotel_ids(user)
+    collected = (
+        select(PriceSeries.check_in, PriceSeries.check_out)
+        .where(
+            PriceSeries.adults == adults,
+            PriceSeries.hotel_id.in_(owned),
+        )
+        .order_by(PriceSeries.check_in.desc())
+    )
+    # TONIGHT, WHENEVER TONIGHT HAS PRICES AT ALL.
+    #
+    # Repricing computes its night as local_today and every proposal on it is
+    # about tonight. A matrix that opens on a different date is two screens
+    # describing two different nights with nothing on either saying so, and
+    # the owner comparing a number from one against a number from the other.
+    #
+    # It also closes the gap the rule below cannot. A night counts as
+    # monitored if some target asked about it, and a target watching a window
+    # weeks out -- Our Resort has a second Booking.com target doing exactly that --
+    # makes a night only that one hotel is priced for the newest monitored
+    # one. Legitimately monitored, and still a comparison of one property
+    # against nobody, which is the failure the rest of this docstring is
+    # about arriving by a road the fix did not cover.
+    #
+    # Falls through when tonight holds nothing yet, so the first morning
+    # before any fetch still opens on real prices rather than an empty grid.
+    # The row's own check_out is returned rather than tonight + 1: a target
+    # on a two-night stay files its prices under its own window.
+    tonight = local_today()
+    row = (await session.execute(
+        collected.where(PriceSeries.check_in == tonight).limit(1)
+    )).first()
+    if row is not None:
+        return row.check_in, row.check_out, "Showing tonight."
+
+    # Correlated on the two date columns of the row being considered: "was
+    # this night ever asked about, for a hotel of yours?"
+    #
+    # OUTER, and null targets count. A price typed into the dashboard by hand
+    # files a check run with no monitor target at all (the manual-entry
+    # endpoint in app/api/v1/targets.py), because nothing scheduled it -- an
+    # operator did. Joining through the target dropped every one of those, so
+    # a hotel with no booking engine, whose prices only ever arrive by hand,
+    # would have had its nights treated exactly like a roll-forward: never the
+    # default, however recent. Manual entry is the fallback this system
+    # promises those hotels, not a second-class reading.
+    #
+    # A target-less run cannot be traced back to a hotel, so it cannot be
+    # ownership-scoped. It does not need to be: the night it nominates still
+    # has to appear in THIS account's price rows above to be chosen at all, so
+    # the worst it can do is agree with a night the account already has.
+    monitored = (
+        select(CheckRun.id)
+        .outerjoin(MonitorTarget, MonitorTarget.id == CheckRun.monitor_target_id)
+        .outerjoin(HotelSource, HotelSource.id == MonitorTarget.hotel_source_id)
+        .where(
+            CheckRun.check_in == PriceSeries.check_in,
+            CheckRun.check_out == PriceSeries.check_out,
+            or_(
+                CheckRun.monitor_target_id.is_(None),
+                HotelSource.hotel_id.in_(owned),
+            ),
+        )
+        .exists()
+    )
+
+    latest = (await session.execute(collected.where(monitored).limit(1))).first()
+    if latest is not None:
+        return latest.check_in, latest.check_out, "Showing the most recent night monitored."
+
+    # No collected night can be traced to a run at all -- history older than
+    # the check-run table, or a restored database that brought the prices and
+    # not the runs. The old behaviour is still the best available answer, and
+    # showing a rolled night beats showing none.
+    latest = (await session.execute(collected.limit(1))).first()
+    if latest is not None:
+        return latest.check_in, latest.check_out, "Showing the most recent night collected."
+
+    # Nothing has ever been collected, so there is no evidence to prefer. The
+    # weekend is as good a first guess as any, and the empty state below
+    # explains itself.
+    weekend = next_weekend(local_today())
+    return weekend.check_in, weekend.check_out, "Defaults to the coming weekend."
+
+
+async def _priced_rows(session, user, check_in: date, check_out: date, adults: int):
+    """``(series, hotel, room_name)`` for one night, for this account's hotels.
+
+    The matrix and the /comparison grid are two shapes of the same reading, so
+    they read it once, here. Ordered by hotel then by the hotel's own room
+    order, which is the order both pages present rooms in.
+
+    RETIRED ROOMS ARE LEFT OUT, and until this filter existed they were not.
+    ``room_types.is_active`` was honoured by ingest, which stops matching new
+    offers to a retired room, and by nothing that draws a screen -- so a room
+    taken out of service still appeared in the grid for every night it had
+    ever been priced on. The flag is how a room that was never a room gets
+    removed (Competitor B's "Beds:", read out of a Booking.com spec table), and
+    a retirement that leaves the row on the comparison screen removes nothing.
+
+    The history is untouched: ``price_series`` still holds every reading, and
+    setting the flag back puts the room straight back on the page.
+    """
+    return (
+        await session.execute(
+            select(PriceSeries, Hotel, RoomType.name)
+            .join(Hotel, PriceSeries.hotel_id == Hotel.id)
+            .join(RoomType, PriceSeries.room_type_id == RoomType.id)
+            .where(
+                PriceSeries.check_in == check_in,
+                PriceSeries.check_out == check_out,
+                PriceSeries.adults == adults,
+                Hotel.is_active.is_(True),
+                RoomType.is_active.is_(True),
+                Hotel.owner_user_id == user.id,
+            )
+            .order_by(Hotel.name, RoomType.sort_order)
+        )
+    ).all()
+
+
+async def _repricing_boards(session, owner_user_id: int) -> dict[int, str]:
+    """``{hotel_id: meal plan}`` for the hotels the repricing rule compares.
+
+    Your own property and the benchmark are priced against each other on the
+    board pinned in Settings, and /repricing shows them on it. The grids show
+    them on it too, so one hotel does not read 8,982 there and 5,638 here.
+    Every other hotel keeps its entry price. Nothing pinned, or no benchmark:
+    nothing to agree with, and every hotel keeps its entry price.
+    """
+    settings = await session.scalar(
+        select(RepricingSettings).where(RepricingSettings.owner_user_id == owner_user_id)
+    )
+    if settings is None or not settings.benchmark_meal_plan or not settings.benchmark_hotel_id:
+        return {}
+    # RE-CHECKED, as the worker and /repricing do: a benchmark since
+    # deactivated or marked as your own is not being followed, and the grids
+    # must not keep showing a board nothing is priced on.
+    if (await session.execute(
+        repricing_data.benchmark_stmt(owner_user_id, settings.benchmark_hotel_id)
+    )).first() is None:
+        return {}
+    ids = set(await session.scalars(
+        select(Hotel.id).where(Hotel.owner_user_id == owner_user_id,
+                               Hotel.is_own_property.is_(True), Hotel.is_active.is_(True))
+    ))
+    ids.add(settings.benchmark_hotel_id)
+    return dict.fromkeys(ids, settings.benchmark_meal_plan)
+
+
+def _matrix_groups(
+    rows, recent_cutoff: datetime, category: str | None, show_with_tax: bool = False,
+    boards: dict[int, str] | None = None,
+):
+    """Hotels with their room cells, plus how many rooms each category has.
+
+    THE COUNTS ARE OF EVERY ROOM, THE CELLS ARE OF THE CHOSEN ONES
+    ==============================================================
+    Both come out of one pass over the same rows, and they deliberately
+    disagree: a filter chip has to keep saying "Suite 7" while the page is
+    filtered to classic rooms, or choosing a category would empty every other
+    chip and there would be no way back except the browser's Back button.
+
+    A hotel with no room in the chosen category is absent from the result
+    rather than present and empty. Its row would say nothing except that the
+    filter is on, which the chips already say, and the comparison reads better
+    as the list of properties that actually sell this category.
+
+    ``cheapest`` is the cheapest of the cells that SURVIVED the filter, so
+    filtering to "Classic Room" answers "who is cheapest on entry-level
+    tonight" rather than repeating the property's overall floor.
+    """
+    grouped: dict[int, dict] = {}
+    counts: dict[str, int] = {}
+
+    # ONE CELL PER ROOM, not one per offer. See price_display.entry_rows: a
+    # room sold room-only, with breakfast and with dinner is three rows here
+    # and was three cells, all carrying the same room's name. The counts are
+    # taken from the same list, so a chip says how many ROOMS a category has
+    # rather than how many ways they are sold.
+    for series, hotel, room_name in entry_rows(rows, show_with_tax, boards):
+        slug = classify(room_name)
+        counts[slug] = counts.get(slug, 0) + 1
+        if category is not None and slug != category:
+            continue
+
+        entry = grouped.setdefault(
+            hotel.id,
+            {"hotel": hotel, "cells": [], "cheapest": None, "sold_out": False},
+        )
+        # The number this cell shows, and whether it had to fall back to the
+        # other basis to have one. See services/price_display.py: the marker is
+        # set only where the site published one component and not the other,
+        # which is exactly where a reader would otherwise compare a pre-tax
+        # rate against an all-in one and see a competitor that is not there.
+        shown = displayed_price(series, show_with_tax)
+        entry["cells"].append(
+            {
+                "room_name": room_name,
+                "offer_key": series.offer_key,
+                "category": slug,
+                "category_label": label_for(slug),
+                "price": shown.amount,
+                "price_note": shown.note,
+                "currency": series.currency,
+                "is_available": series.is_available,
+                "changed_recently": (
+                    series.last_changed_at is not None
+                    and series.last_changed_at >= recent_cutoff
+                ),
+                "last_checked_at": series.last_checked_at,
+            }
+        )
+
+    for entry in grouped.values():
+        # Over the RENDERED numbers, not the stored ones. Totalling the cells
+        # with tax while the summary above them stayed pre-tax would put a
+        # "cheapest" on the row that is lower than every price beside it.
+        entry["cheapest"] = cheapest_shown(
+            [Shown(c["price"]) for c in entry["cells"] if c["is_available"] and c["price"]]
+        )
+
+    return grouped, counts
+
+
+#: Width of one price column on the matrix, in the currency's units.
+MATRIX_BAND = 500
+
+
+def _price_bands(entries: list[dict], step: int = MATRIX_BAND) -> list[int]:
+    """Lay the matrix out by price: one column per ``step`` of price.
+
+    Returns the band starts (1000, 1500, 2000, ...) and files each hotel's
+    bookable rooms under ``entry["bands"][start]``, cheapest first. A band
+    holds prices from its start up to, not including, the next one's.
+
+    ONLY BANDS SOMEBODY SELLS IN ARE COLUMNS. A band no hotel has a room in
+    tonight is left out, so the table fits the screen instead of spending
+    most of its width on empty columns. The headings still say where each
+    column starts, so a jump from 7,500 to 9,500 reads as the gap it is.
+
+    SOLD-OUT ROOMS ARE NOT PUT IN A BAND. Their figure is the last rate seen,
+    not one a guest can book tonight, and a price column is a claim that it
+    can. They go to ``entry["sold_out_cells"]`` and a column of their own.
+    """
+    def band_of(price) -> int:
+        return int(price // step) * step
+
+    starts: set[int] = set()
+    for entry in entries:
+        entry["bands"] = {}
+        entry["sold_out_cells"] = []
+        for cell in entry["cells"]:
+            if cell["is_available"] and cell["price"]:
+                start = band_of(cell["price"])
+                entry["bands"].setdefault(start, []).append(cell)
+                starts.add(start)
+            else:
+                entry["sold_out_cells"].append(cell)
+        for cells in entry["bands"].values():
+            cells.sort(key=lambda c: c["price"])
+    return sorted(starts)
+
+
+async def _sold_out_hotels(session, user, check_in: date, check_out: date, adults: int):
+    """``(hotel, last_checked_at)`` for properties a good fetch found full.
+
+    Both comparison screens need this list and neither can derive it from
+    ``price_series``: these engines file nothing at all for a night they are
+    full on, so the evidence that anyone looked lives only on the check run.
+    The matrix turns the list into rows with the rolled night's prices; the
+    /comparison grid names them under the table, having no rate for tonight to
+    put in a cell. One query, one definition of "checked and full", so the two
+    pages cannot come to disagree about which hotels those are.
+    """
+    return (
+        await session.execute(
+            select(Hotel, func.max(CheckRun.started_at).label("checked_at"))
+            .select_from(CheckRun)
+            .join(MonitorTarget, MonitorTarget.id == CheckRun.monitor_target_id)
+            .join(HotelSource, HotelSource.id == MonitorTarget.hotel_source_id)
+            .join(Hotel, Hotel.id == HotelSource.hotel_id)
+            .where(
+                CheckRun.check_in == check_in,
+                CheckRun.check_out == check_out,
+                CheckRun.status == CheckRunStatus.SUCCESS,
+                CheckRun.sold_out.is_(True),
+                # The occupancy lives on the target, not the run: a run is one
+                # page load, and the page was asked for these guests. Without
+                # it a 2-adult grid would grow rows from a 4-adult target.
+                MonitorTarget.adults == adults,
+                Hotel.is_active.is_(True),
+                Hotel.owner_user_id == user.id,
+            )
+            .group_by(Hotel.id)
+        )
+    ).all()
+
+
+async def _sold_out_rows(
+    session, user, check_in: date, check_out: date, adults: int, already: set[int],
+    show_with_tax: bool = False,
+):
+    """Hotels that WERE checked for this night and listed no room at all.
+
+    A HOTEL WITH NO ROWS IS NOT A HOTEL NOBODY LOOKED AT
+    ====================================================
+    The grid above is built from ``price_series``, so a property appears only
+    if the night produced at least one row. That silently splits the sold-out
+    hotels in two, along a line that is about the booking engine rather than
+    about the hotel:
+
+    * Competitor A's engine lists its rooms and prints "sold out" under each, so
+      three unavailable rows are filed and the property shows up correctly.
+    * Aiosell and the portal simply omit the rooms. ``sold_out_detected`` is
+      true, the fetcher rolls forward and prices the NEXT night (see
+      ``_with_rollover``), and NOTHING is filed under the night asked for.
+
+    On Saturday 5 Sep, eight of ten hotels were full and seven of those were
+    the second kind. Every one of them was fetched successfully at 09:30, and
+    the comparison screen showed three properties -- indistinguishable, to
+    anyone looking at it, from a fetcher that had stopped running.
+
+    So the row comes from the check run instead, which recorded exactly this:
+    a successful fetch, for these dates, that found the hotel sold out. No
+    price is invented for it. A sold-out night quotes no rate, and filing a
+    placeholder series would need a meal plan and a refundability the empty
+    response never carried -- an offer key that could never match the real one
+    when the rooms came back.
+
+    ``next_priced`` is the night their prices DID land on, read from what was
+    actually collected rather than assumed to be the following day, so the
+    rolled reading is one click away instead of a date somebody has to guess.
+    """
+    checked = await _sold_out_hotels(session, user, check_in, check_out, adults)
+
+    hotels = [(h, checked_at) for h, checked_at in checked if h.id not in already]
+    if not hotels:
+        return []
+
+    # Where the rolled reading landed, AND WHAT EACH ROOM COSTS THERE.
+    #
+    # ONE CARD PER ROOM, LIKE EVERY OTHER FULL HOTEL
+    # ==============================================
+    # A hotel whose engine labels its rooms sold out shows a card each, with
+    # the rate it was asking underneath. These properties list nothing at all
+    # when full, so they had one grey "no rooms listed" box and the row said
+    # less about them than about any competitor beside it -- which is backwards,
+    # because being full is the interesting thing a competitor did.
+    #
+    # They still priced their rooms, on the night the fetcher rolled forward
+    # to. Those are real per-room readings taken today, so the row is built
+    # from them and reads like the others.
+    #
+    # EVERY BORROWED PRICE CARRIES ITS DATE
+    # =====================================
+    # It has to. A rate from another night shown bare in this grid reads as
+    # tonight's, and that is the mistake absolute dates in the offer key exist
+    # to make impossible -- there is no point being rigorous in the database
+    # and loose on the screen. So the cell says "06 Sep", every time, and the
+    # cheapest column stays empty: none of it can be booked tonight.
+    rows_by_hotel: dict[int, list] = {}
+    onward: dict[int, tuple[date, date]] = {}
+    for series, hotel_id, room_name in (
+        await session.execute(
+            select(PriceSeries, PriceSeries.hotel_id, RoomType.name)
+            .join(RoomType, RoomType.id == PriceSeries.room_type_id)
+            .where(
+                PriceSeries.hotel_id.in_([h.id for h, _ in hotels]),
+                PriceSeries.adults == adults,
+                PriceSeries.check_in > check_in,
+            )
+            .order_by(PriceSeries.check_in, RoomType.sort_order)
+        )
+    ).all():
+        # The earliest night after this one wins -- a roll goes forward, never
+        # back -- and rows are already in date order, so the first night seen
+        # for a hotel is its night and later ones belong to another target.
+        night = onward.setdefault(hotel_id, (series.check_in, series.check_out))
+        if (series.check_in, series.check_out) != night:
+            continue
+        shown = displayed_price(series, show_with_tax)
+        rows_by_hotel.setdefault(hotel_id, []).append(
+            {
+                "room_name": room_name,
+                "offer_key": series.offer_key,
+                "category": classify(room_name),
+                "category_label": label_for(classify(room_name)),
+                "price": shown.amount,
+                "price_note": shown.note,
+                "currency": series.currency,
+                # Sold out for the night being SHOWN. What it costs on the
+                # night it was priced is the figure beside it, and `for_night`
+                # is what stops the two being read as one claim.
+                "is_available": False,
+                "changed_recently": False,
+                "for_night": series.check_in,
+                "last_checked_at": series.last_checked_at,
+            }
+        )
+
+    return [
+        {
+            "hotel": hotel,
+            "cells": rows_by_hotel.get(hotel.id, []),
+            # Deliberately empty even when the cells carry prices. "Cheapest"
+            # answers "what can I book tonight", and not one of these can be.
+            "cheapest": None,
+            "sold_out": True,
+            "checked_at": checked_at,
+            "next_priced": onward.get(hotel.id),
+        }
+        for hotel, checked_at in hotels
+    ]
+
+
+@router.get("/matrix", response_class=HTMLResponse)
+async def matrix(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    check_in: BlankableDate = None,
+    check_out: BlankableDate = None,
+    adults: BlankableAdults = None,
+    category: str | None = None,
+    view: str | None = None,
+):
+    """All hotels x rooms for one night. The comparison screen.
+
+    DEFAULTS TO A NIGHT THAT HAS BEEN COLLECTED, which is not the same as the
+    night one would most like to see. It defaulted to the coming weekend --
+    the window where rates move most, and a good answer if anything were
+    watching it. Every enabled target on this deployment is rolling with a
+    lead time of zero, so the only nights that ever have prices are tonight
+    and the recent past, and the comparison screen opened empty every single
+    day: "Nothing has been collected for these dates" about dates the page
+    itself had chosen.
+
+    A default is a guess at what someone wants to see. Guessing at data that
+    exists beats guessing at data that would be more interesting. Which night
+    exactly, and why not simply the newest one, is ``_default_night`` above.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    # Clearing the number input submits ``adults=``, which is a request for the
+    # default rather than a request for nothing -- the query below compares it
+    # to a NOT NULL column and would match no rows at all.
+    if adults is None:
+        adults = 2
+
+    # A category the code does not have -- an empty string from the "All" chip,
+    # a slug from an older bookmark, a typo in a shared URL -- shows everything
+    # rather than 422s or shows nothing. The chips below then make the real
+    # choices visible, which a validation error would not.
+    if not is_category(category):
+        category = None
+
+    default_note = None
+    if check_in is None or check_out is None:
+        check_in, check_out, default_note = await _default_night(session, user, adults)
+
+    rows = await _priced_rows(session, user, check_in, check_out, adults)
+
+    recent_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    show_with_tax = await _show_prices_with_tax(session)
+    grouped, counts = _matrix_groups(rows, recent_cutoff, category, show_with_tax,
+                                     await _repricing_boards(session, user.id))
+
+    # Hotels whose engine reports a full night by listing nothing. They have no
+    # room to put in a category, so they join the unfiltered view only: under a
+    # chip the grid answers "who sells this tier tonight", and a property whose
+    # rooms are unknown tonight is not an answer to it.
+    sold_out = (
+        await _sold_out_rows(
+            session, user, check_in, check_out, adults, set(grouped), show_with_tax
+        )
+        if category is None
+        else []
+    )
+    listed = sorted(
+        list(grouped.values()) + sold_out, key=lambda e: e["hotel"].name
+    )
+    # "bands" is the Price comparison view; anything else is the room cards
+    # the page has always opened on.
+    view = "bands" if view == "bands" else "rooms"
+    bands = _price_bands(listed) if view == "bands" else []
+
+    # One chip per category that has a room on this night, in the order of the
+    # sheet this page replaced. A category nothing is sold under is left out
+    # rather than shown at zero: a dead chip is a control that does nothing,
+    # and a row of them would bury the ones that work.
+    # The chosen one is kept even at zero, so a link somebody shared for a
+    # category nothing is sold under tonight still shows WHICH filter is on.
+    # Without it the page reads as broken: an empty grid and no chip lit.
+    chips = [
+        {"slug": c.slug, "label": c.label, "count": counts.get(c.slug, 0)}
+        for c in CATEGORIES
+        if counts.get(c.slug) or c.slug == category
+    ]
+
+    # Rooms exist for this night, but none in the chosen category. That is a
+    # different sentence from "nothing has been collected", and saying the
+    # wrong one sends someone off to debug a fetcher that is working.
+    filtered_out = bool(rows) and not grouped
+
+    # Which nights DO have prices, for the empty state. "Nothing here" is a
+    # dead end; "nothing here, and these are the nights that have something"
+    # is the answer to the question the empty page provokes -- and on a
+    # deployment whose targets all run at zero lead time, it is also the
+    # explanation for why every other date is blank.
+    #
+    # Not asked when the filter is what emptied the page: this night HAS
+    # prices, so a list of other nights to try would be answering a question
+    # nobody asked, and it costs a query to be wrong.
+    collected: list = []
+    if not listed and not filtered_out:
+        collected = (
+            await session.execute(
+                select(PriceSeries.check_in, PriceSeries.check_out, PriceSeries.adults)
+                .where(PriceSeries.hotel_id.in_(owned_hotel_ids(user)))
+                .group_by(PriceSeries.check_in, PriceSeries.check_out, PriceSeries.adults)
+                .order_by(PriceSeries.check_in.desc())
+                .limit(6)
+            )
+        ).all()
+
+    return await _render(
+        request, user, session, "matrix.html",
+        rows=listed,
+        check_in=check_in,
+        check_out=check_out,
+        adults=adults,
+        category=category,
+        category_label=label_for(category) if category else None,
+        view=view,
+        bands=bands,
+        band_step=MATRIX_BAND,
+        chips=chips,
+        filtered_out=filtered_out,
+        default_note=default_note,
+        collected=collected,
+        show_with_tax=show_with_tax,
+    )
+
+
+# -- matrix Excel export --------------------------------------------
+@router.get("/matrix/export")
+async def matrix_export(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    check_in: BlankableDate = None,
+    check_out: BlankableDate = None,
+    adults: BlankableAdults = None,
+    category: str | None = None,
+):
+    """Download the Price comparison table as an Excel file."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    if user is None:
+        return _redirect_to_login(request)
+
+    if adults is None:
+        adults = 2
+    if not is_category(category):
+        category = None
+    if check_in is None or check_out is None:
+        check_in, check_out, _ = await _default_night(session, user, adults)
+
+    rows = await _priced_rows(session, user, check_in, check_out, adults)
+    recent_cutoff = datetime.now(UTC) - timedelta(hours=24)
+    show_with_tax = await _show_prices_with_tax(session)
+    grouped, _ = _matrix_groups(
+        rows, recent_cutoff, category, show_with_tax,
+        await _repricing_boards(session, user.id),
+    )
+    sold_out = (
+        await _sold_out_rows(
+            session, user, check_in, check_out, adults, set(grouped), show_with_tax
+        )
+        if category is None
+        else []
+    )
+    listed = sorted(
+        list(grouped.values()) + sold_out, key=lambda e: e["hotel"].name
+    )
+    bands = _price_bands(listed)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Price Comparison"
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="1F3864")
+    own_fill = PatternFill("solid", fgColor="E8F4E8")
+    changed_fill = PatternFill("solid", fgColor="FFF3CD")
+    soldout_fill = PatternFill("solid", fgColor="F8D7DA")
+    center = Alignment(horizontal="center", vertical="top", wrap_text=True)
+    left = Alignment(horizontal="left", vertical="top")
+
+    # Title row
+    night = f"{check_in.strftime('%d %b')} – {check_out.strftime('%d %b %Y')}, {adults} adult{'s' if adults != 1 else ''}"
+    ws.cell(row=1, column=1, value=f"Price Comparison · {night}")
+    ws.cell(row=1, column=1).font = Font(bold=True, size=13)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(bands) + 2)
+
+    # Header row
+    hrow = 2
+    ws.cell(row=hrow, column=1, value="Hotel").font = header_font
+    ws.cell(row=hrow, column=1).fill = header_fill
+    ws.cell(row=hrow, column=1).alignment = left
+    for i, start in enumerate(bands, start=2):
+        cell = ws.cell(row=hrow, column=i,
+                       value=f"₹{start:,} – {start + MATRIX_BAND - 1:,}")
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+    sold_col = len(bands) + 2
+    ws.cell(row=hrow, column=sold_col, value="Sold out").font = header_font
+    ws.cell(row=hrow, column=sold_col).fill = header_fill
+    ws.cell(row=hrow, column=sold_col).alignment = center
+
+    # Data rows
+    for entry in listed:
+        r = ws.max_row + 1
+        hotel_cell = ws.cell(row=r, column=1, value=entry["hotel"].name)
+        hotel_cell.alignment = left
+        if entry["hotel"].is_own_property:
+            hotel_cell.fill = own_fill
+            hotel_cell.font = Font(bold=True)
+
+        for i, start in enumerate(bands, start=2):
+            cells = entry.get("bands", {}).get(start, [])
+            if cells:
+                lines = []
+                for c in cells:
+                    price_str = money(c["price"], c["currency"]) if c["price"] else "–"
+                    lines.append(f"{c['room_name']}\n{price_str}")
+                    if c.get("price_note"):
+                        lines[-1] += f"\n({c['price_note']})"
+                cell = ws.cell(row=r, column=i, value="\n\n".join(lines))
+                cell.alignment = center
+                if any(c.get("changed_recently") for c in cells):
+                    cell.fill = changed_fill
+
+        sold_cells = entry.get("sold_out_cells", [])
+        if entry.get("sold_out") and not sold_cells:
+            ws.cell(row=r, column=sold_col, value="no rooms listed").fill = soldout_fill
+        elif sold_cells:
+            lines = []
+            for c in sold_cells:
+                line = c["room_name"]
+                if c.get("price"):
+                    if c.get("for_night"):
+                        line += f"\n{c['for_night'].strftime('%d %b')} {money(c['price'], c['currency'])}"
+                    else:
+                        line += f"\nwas {money(c['price'], c['currency'])}"
+                lines.append(line)
+            cell = ws.cell(row=r, column=sold_col, value="\n\n".join(lines))
+            cell.fill = soldout_fill
+            cell.alignment = center
+
+    # Column widths
+    ws.column_dimensions["A"].width = 28
+    for i in range(2, len(bands) + 3):
+        ws.column_dimensions[get_column_letter(i)].width = 22
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    filename = f"price-comparison-{check_in}.xlsx"
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# -- price history ---------------------------------------------------
+@router.get("/price-history", response_class=HTMLResponse)
+async def price_history_page(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    hotel_id: BlankableInt = None,
+    check_in: BlankableDate = None,
+    check_out: BlankableDate = None,
+    adults: BlankableAdults = None,
+):
+    """Price history: one column per calendar day, one row per room.
+
+    Columns are the last 10 local dates (newest → oldest). Each cell shows
+    the last observed price on that day. A dash means the room was not
+    checked that day.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    if adults is None:
+        adults = 2
+
+    default_note = None
+    if check_in is None or check_out is None:
+        check_in, check_out, default_note = await _default_night(session, user, adults)
+
+    owned = owned_hotel_ids(user)
+    if hotel_id and hotel_id not in owned:
+        hotel_id = None
+
+    all_hotels = (
+        await session.scalars(
+            select(Hotel)
+            .where(Hotel.is_active.is_(True), Hotel.owner_user_id == user.id)
+            .order_by(Hotel.name)
+        )
+    ).all()
+
+    # Last 10 individual readings per room, most recent first.
+    # A date-based pivot would show only one cell per day and collapse all
+    # intraday checks into one — so if monitoring runs every 30 minutes, nine
+    # out of ten readings disappear. Row_number over the raw observations keeps
+    # every check visible.
+    rn_expr = func.row_number().over(
+        partition_by=PriceObservation.offer_key,
+        order_by=PriceObservation.checked_at.desc(),
+    ).label("rn")
+
+    obs_sub = select(
+        PriceObservation.offer_key,
+        PriceObservation.checked_at,
+        PriceObservation.price_exclusive,
+        PriceObservation.price_inclusive,
+        PriceObservation.taxes_fees,
+        PriceObservation.is_available,
+        PriceObservation.currency,
+        rn_expr,
+    ).subquery("obs_rn")
+
+    where_clauses = [
+        obs_sub.c.rn <= 10,
+        PriceSeries.check_in == check_in,
+        PriceSeries.check_out == check_out,
+        PriceSeries.adults == adults,
+        Hotel.is_active.is_(True),
+        RoomType.is_active.is_(True),
+        Hotel.owner_user_id == user.id,
+    ]
+    if hotel_id:
+        where_clauses.append(Hotel.id == hotel_id)
+
+    raw_rows = (
+        await session.execute(
+            select(
+                Hotel.id.label("hid"),
+                Hotel.name.label("hotel_name"),
+                Hotel.is_own_property,
+                RoomType.sort_order,
+                RoomType.name.label("room_name"),
+                PriceSeries.meal_plan,
+                PriceSeries.offer_key,
+                obs_sub.c.currency,
+                obs_sub.c.checked_at,
+                obs_sub.c.price_exclusive,
+                obs_sub.c.price_inclusive,
+                obs_sub.c.taxes_fees,
+                obs_sub.c.is_available,
+                obs_sub.c.rn,
+            )
+            .select_from(obs_sub)
+            .join(PriceSeries, PriceSeries.offer_key == obs_sub.c.offer_key)
+            .join(Hotel, Hotel.id == PriceSeries.hotel_id)
+            .join(RoomType, RoomType.id == PriceSeries.room_type_id)
+            .where(*where_clauses)
+            .order_by(Hotel.name, RoomType.sort_order, PriceSeries.offer_key, obs_sub.c.rn)
+        )
+    ).all()
+
+    show_with_tax = await _show_prices_with_tax(session)
+
+    history: dict[int, dict] = {}
+    for row in raw_rows:
+        if row.hid not in history:
+            history[row.hid] = {
+                "hotel_name": row.hotel_name,
+                "is_own": row.is_own_property,
+                "rooms": {},
+            }
+        h = history[row.hid]
+        if row.offer_key not in h["rooms"]:
+            h["rooms"][row.offer_key] = {
+                "room_name": row.room_name,
+                "meal_plan": row.meal_plan,
+                "currency": row.currency,
+                "observations": [],
+            }
+
+        if show_with_tax:
+            price = row.price_inclusive if row.price_inclusive is not None else row.price_exclusive
+            note = "excl. tax" if row.price_inclusive is None and row.price_exclusive is not None else None
+        else:
+            price = row.price_exclusive if row.price_exclusive is not None else row.price_inclusive
+            note = "incl. tax" if row.price_exclusive is None and row.price_inclusive is not None else None
+
+        h["rooms"][row.offer_key]["observations"].append({
+            "price": price,
+            "price_note": note,
+            "currency": row.currency,
+            "checked_at": row.checked_at,
+            "is_available": row.is_available,
+        })
+
+    hotels_data = [
+        {**v, "rooms": list(v["rooms"].values())}
+        for v in history.values()
+    ]
+
+    return await _render(
+        request, user, session, "price_history.html",
+        hotels_data=hotels_data,
+        all_hotels=all_hotels,
+        hotel_id=hotel_id,
+        check_in=check_in,
+        check_out=check_out,
+        adults=adults,
+        default_note=default_note,
+        show_with_tax=show_with_tax,
+    )
+
+
+@router.get("/price-history/export")
+async def price_history_export(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    hotel_id: BlankableInt = None,
+    check_in: BlankableDate = None,
+    check_out: BlankableDate = None,
+    adults: BlankableAdults = None,
+):
+    """Download 1 month of price history as a pivoted Excel file.
+
+    Layout matches the web page: Hotel | Room | Plan | 28 Sep | 27 Sep | …
+    Each date column holds the last observed price on that day.
+    Sold-out cells say "sold out". Empty cells mean no check ran that day.
+    """
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    if user is None:
+        return _redirect_to_login(request)
+
+    if adults is None:
+        adults = 2
+
+    owned = owned_hotel_ids(user)
+    if hotel_id and hotel_id not in owned:
+        hotel_id = None
+
+    if check_in is None or check_out is None:
+        check_in, check_out, _ = await _default_night(session, user, adults)
+
+    if check_in is None or check_out is None:
+        check_in, check_out, _ = await _default_night(session, user, adults)
+
+    tz_name = get_settings().timezone
+
+    # Last 50 individual readings per room, most recent first.
+    rn_expr = func.row_number().over(
+        partition_by=PriceObservation.offer_key,
+        order_by=PriceObservation.checked_at.desc(),
+    ).label("rn")
+
+    obs_sub = select(
+        PriceObservation.offer_key,
+        PriceObservation.checked_at,
+        PriceObservation.price_exclusive,
+        PriceObservation.price_inclusive,
+        PriceObservation.is_available,
+        PriceObservation.currency,
+        rn_expr,
+    ).subquery("obs_50")
+
+    where_clauses = [
+        obs_sub.c.rn <= 50,
+        PriceSeries.check_in == check_in,
+        PriceSeries.check_out == check_out,
+        PriceSeries.adults == adults,
+        Hotel.is_active.is_(True),
+        RoomType.is_active.is_(True),
+        Hotel.owner_user_id == user.id,
+    ]
+    if hotel_id:
+        where_clauses.append(Hotel.id == hotel_id)
+
+    raw_rows = (
+        await session.execute(
+            select(
+                Hotel.id.label("hid"),
+                Hotel.name.label("hotel_name"),
+                Hotel.is_own_property,
+                RoomType.sort_order,
+                RoomType.name.label("room_name"),
+                PriceSeries.meal_plan,
+                PriceSeries.offer_key,
+                obs_sub.c.currency,
+                obs_sub.c.checked_at,
+                obs_sub.c.price_exclusive,
+                obs_sub.c.price_inclusive,
+                obs_sub.c.is_available,
+                obs_sub.c.rn,
+            )
+            .select_from(obs_sub)
+            .join(PriceSeries, PriceSeries.offer_key == obs_sub.c.offer_key)
+            .join(Hotel, Hotel.id == PriceSeries.hotel_id)
+            .join(RoomType, RoomType.id == PriceSeries.room_type_id)
+            .where(*where_clauses)
+            .order_by(Hotel.name, RoomType.sort_order, PriceSeries.offer_key, obs_sub.c.rn)
+        )
+    ).all()
+
+    show_with_tax = await _show_prices_with_tax(session)
+    tz = ZoneInfo(tz_name)
+
+    # Group into hotels → rooms → observations list (same as web page).
+    history: dict[int, dict] = {}
+    for row in raw_rows:
+        if row.hid not in history:
+            history[row.hid] = {
+                "hotel_name": row.hotel_name,
+                "is_own": row.is_own_property,
+                "rooms": {},
+            }
+        h = history[row.hid]
+        if row.offer_key not in h["rooms"]:
+            h["rooms"][row.offer_key] = {
+                "room_name": row.room_name,
+                "meal_plan": row.meal_plan,
+                "currency": row.currency,
+                "observations": [],
+            }
+        if show_with_tax:
+            price = row.price_inclusive if row.price_inclusive is not None else row.price_exclusive
+        else:
+            price = row.price_exclusive if row.price_exclusive is not None else row.price_inclusive
+
+        h["rooms"][row.offer_key]["observations"].append({
+            "price": price,
+            "is_available": row.is_available,
+            "checked_at": row.checked_at,
+        })
+
+    hotels_list = [
+        {**v, "rooms": list(v["rooms"].values())}
+        for v in history.values()
+    ]
+
+    # How many reading columns we need (up to 50).
+    max_obs = max(
+        (len(room["observations"]) for h in hotels_list for room in h["rooms"]),
+        default=0,
+    )
+
+    # ── Build the workbook ──────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Price History"
+    ws.freeze_panes = "D2"  # freeze hotel/room/plan, scroll price columns
+
+    hdr_font  = Font(bold=True, color="FFFFFF")
+    hdr_fill  = PatternFill("solid", fgColor="1F3864")
+    own_fill  = PatternFill("solid", fgColor="EAF4EA")
+    sold_fill = PatternFill("solid", fgColor="FDE8E8")
+    left      = Alignment(horizontal="left",   vertical="top")
+    center    = Alignment(horizontal="center", vertical="top", wrap_text=True)
+
+    # ── Row 1: fixed headers + reading number headers ──────────────────
+    for col, label in enumerate(["Hotel", "Room", "Meal Plan"], start=1):
+        c = ws.cell(row=1, column=col, value=label)
+        c.font = hdr_font
+        c.fill = hdr_fill
+        c.alignment = left
+
+    for n in range(1, max_obs + 1):
+        c = ws.cell(row=1, column=3 + n, value=f"{'Latest' if n == 1 else str(n)}")
+        c.font = hdr_font
+        c.fill = hdr_fill
+        c.alignment = center
+
+    # ── Data rows: one row per room, merged hotel name ─────────────────
+    data_row = 2
+    for hotel in hotels_list:
+        hotel_start = data_row
+        room_fill = own_fill if hotel["is_own"] else None
+
+        for room in hotel["rooms"]:
+            # Hotel name written on first room of this hotel; merged below.
+            c = ws.cell(row=data_row, column=1, value=hotel["hotel_name"])
+            c.alignment = left
+            c.font = Font(bold=True)
+            if room_fill:
+                c.fill = room_fill
+
+            ws.cell(row=data_row, column=2, value=room["room_name"]).alignment = left
+            ws.cell(row=data_row, column=3, value=room["meal_plan"] or "").alignment = left
+
+            for i, obs in enumerate(room["observations"], start=1):
+                col = 3 + i
+                local_dt = obs["checked_at"].astimezone(tz) if obs["checked_at"] else None
+                time_str = local_dt.strftime("%d %b %H:%M") if local_dt else ""
+
+                if not obs["is_available"]:
+                    c = ws.cell(row=data_row, column=col,
+                                value=f"sold out\n{time_str}")
+                    c.fill = sold_fill
+                    c.alignment = center
+                elif obs["price"] is not None:
+                    c = ws.cell(row=data_row, column=col,
+                                value=f"₹{obs['price']:,.0f}\n{time_str}")
+                    c.alignment = center
+                    if room_fill:
+                        c.fill = room_fill
+                else:
+                    ws.cell(row=data_row, column=col, value="").alignment = center
+
+            # Pad empty slots up to max_obs
+            for i in range(len(room["observations"]) + 1, max_obs + 1):
+                ws.cell(row=data_row, column=3 + i, value="—").alignment = center
+
+            data_row += 1
+
+        # Merge hotel name across all its room rows.
+        if data_row - hotel_start > 1:
+            ws.merge_cells(
+                start_row=hotel_start, start_column=1,
+                end_row=data_row - 1, end_column=1,
+            )
+            merged = ws.cell(row=hotel_start, column=1)
+            merged.alignment = Alignment(horizontal="left", vertical="top")
+            merged.font = Font(bold=True)
+            if room_fill:
+                merged.fill = room_fill
+
+    # ── Column widths ──────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 28
+    ws.column_dimensions["C"].width = 14
+    for i in range(4, 4 + max_obs):
+        ws.column_dimensions[get_column_letter(i)].width = 14
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    fname = f"price-history-{check_in}.xlsx"
+    if hotel_id:
+        hotel_obj = await session.get(Hotel, hotel_id)
+        if hotel_obj:
+            slug = hotel_obj.name.lower().replace(" ", "-")
+            fname = f"price-history-{slug}-{check_in}.xlsx"
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+# -- comparison ------------------------------------------------------
+@router.get("/comparison", response_class=HTMLResponse)
+async def comparison(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    check_in: BlankableDate = None,
+    check_out: BlankableDate = None,
+    adults: BlankableAdults = None,
+    baseline: BlankableInt = None,
+):
+    """Your rate against every competitor's, by room category.
+
+    The same night, the same rows and the same tax basis as the matrix — a
+    second shape of one reading rather than a second reading, so the two pages
+    cannot show different prices for the same room. What is added is the
+    subtraction: each cell carries the gap between that property's entry price
+    for the tier and yours. See app/services/rate_gap.py for what is and is
+    not allowed to be subtracted.
+
+    ``baseline`` picks between own properties and is offered only when there
+    is more than one. An id that is not one of yours falls back to the first
+    of yours rather than 404ing: a stale bookmark should show the page it was
+    saved for, and there is nothing here that a wrong baseline could leak —
+    the query is ownership-scoped either way.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    if adults is None:
+        adults = 2
+
+    default_note = None
+    if check_in is None or check_out is None:
+        check_in, check_out, default_note = await _default_night(session, user, adults)
+
+    # Yours, in name order, so "the first of yours" is a stable choice rather
+    # than whatever the database happened to return first.
+    own = (
+        await session.scalars(
+            select(Hotel)
+            .where(
+                Hotel.owner_user_id == user.id,
+                Hotel.is_own_property.is_(True),
+                Hotel.is_active.is_(True),
+            )
+            .order_by(Hotel.name)
+        )
+    ).all()
+    chosen = next((h for h in own if h.id == baseline), None) or (own[0] if own else None)
+
+    rows = await _priced_rows(session, user, check_in, check_out, adults)
+    show_with_tax = await _show_prices_with_tax(session)
+    grid = rate_gap.build(
+        rows,
+        baseline_hotel_id=chosen.id if chosen else None,
+        show_with_tax=show_with_tax,
+        boards=await _repricing_boards(session, user.id),
+    )
+
+    # Properties whose engine files nothing when they are full. They have no
+    # rate for tonight, so they get no row and no gap -- naming them under the
+    # table is the whole of what can honestly be said about them here, and it
+    # is worth saying: a competitor missing from the grid otherwise reads as a
+    # competitor nobody checked.
+    seen = {grid.baseline.hotel.id} if grid.baseline else set()
+    seen |= {r.hotel.id for r in grid.rivals}
+    full = [
+        hotel
+        for hotel, _ in await _sold_out_hotels(session, user, check_in, check_out, adults)
+        if hotel.id not in seen
+    ]
+
+    return await _render(
+        request, user, session, "comparison.html",
+        grid=grid,
+        own=own,
+        baseline=chosen,
+        full=full,
+        check_in=check_in,
+        check_out=check_out,
+        adults=adults,
+        default_note=default_note,
+        show_with_tax=show_with_tax,
+    )
+
+
+# -- the page an alert links to --------------------------------------
+@router.get("/c/{token}", response_class=HTMLResponse)
+async def shared_comparison(request: Request, token: str, session: DbSession):
+    """The comparison, opened from the bottom of an alert. No login.
+
+    The recipients of a WhatsApp alert are phone numbers, not accounts. A
+    login-walled link would reach none of them, so this is a bearer page: the
+    token is the whole of the authorisation, and it expires.
+
+    WHAT KEEPS IT FROM BEING A HOLE
+    ===============================
+    The token names a row, and the row names an owner, a night and an
+    occupancy. Every query below is the SAME helper the signed-in page calls,
+    filtered by the owner on that row -- not by anything the visitor sent. So
+    the widest thing a stolen link can be made to show is the page it already
+    showed: there is no parameter here to widen, re-date, or point at somebody
+    else's hotels.
+
+    ``_render`` is deliberately not used. It builds the attention badge and the
+    navigation, and a page for somebody with no account must not carry a nav
+    into screens they cannot open -- every item a dead end at the login form.
+
+    A DEAD LINK SAYS SO, in the reader's terms. An expired or unknown token
+    renders a page explaining that the link has expired and prices move on,
+    rather than a bare 404 that reads as the business having gone offline.
+    """
+    link = await comparison_links.resolve(session, token)
+    if link is None:
+        return templates.TemplateResponse(
+            request=request, name="shared_gone.html", context={}, status_code=404
+        )
+
+    owner = await session.get(User, link.owner_user_id)
+    if owner is None or not owner.is_active:
+        # The account the link belongs to is gone or switched off. Same page as
+        # an expired token, on purpose: which of the two it was is not the
+        # reader's business, and saying would tell an unknown holder whether a
+        # token they guessed at ever existed.
+        return templates.TemplateResponse(
+            request=request, name="shared_gone.html", context={}, status_code=404
+        )
+
+    own = (
+        await session.scalars(
+            select(Hotel)
+            .where(
+                Hotel.owner_user_id == owner.id,
+                Hotel.is_own_property.is_(True),
+                Hotel.is_active.is_(True),
+            )
+            .order_by(Hotel.name)
+        )
+    ).all()
+    chosen = (
+        next((h for h in own if h.id == link.baseline_hotel_id), None)
+        or (own[0] if own else None)
+    )
+
+    rows = await _priced_rows(session, owner, link.check_in, link.check_out, link.adults)
+    show_with_tax = await _show_prices_with_tax(session)
+    grid = rate_gap.build(
+        rows,
+        baseline_hotel_id=chosen.id if chosen else None,
+        show_with_tax=show_with_tax,
+        boards=await _repricing_boards(session, owner.id),
+    )
+
+    seen = {grid.baseline.hotel.id} if grid.baseline else set()
+    seen |= {r.hotel.id for r in grid.rivals}
+    full = [
+        hotel
+        for hotel, _ in await _sold_out_hotels(
+            session, owner, link.check_in, link.check_out, link.adults
+        )
+        if hotel.id not in seen
+    ]
+
+    return templates.TemplateResponse(
+        request=request,
+        name="shared_comparison.html",
+        context={
+            "grid": grid,
+            "baseline": chosen,
+            "full": full,
+            "check_in": link.check_in,
+            "check_out": link.check_out,
+            "adults": link.adults,
+            "show_with_tax": show_with_tax,
+            "expires_at": link.expires_at,
+        },
+    )
+
+
+# -- hotels ----------------------------------------------------------
+@router.get("/hotels", response_class=HTMLResponse)
+async def hotels_page(
+    request: Request, user: DashUser, session: DbSession, q: str | None = None
+):
+    if user is None:
+        return _redirect_to_login(request)
+
+    statement = scope_hotels(select(Hotel), user).order_by(Hotel.name)
+    if q:
+        statement = statement.where(Hotel.name.ilike(f"%{q}%"))
+    hotels = (await session.scalars(statement)).all()
+
+    target_counts = dict(
+        (
+            await session.execute(
+                select(HotelSource.hotel_id, func.count(MonitorTarget.id))
+                .join(MonitorTarget, MonitorTarget.hotel_source_id == HotelSource.id)
+                .where(HotelSource.hotel_id.in_(owned_hotel_ids(user)))
+                .group_by(HotelSource.hotel_id)
+            )
+        ).all()
+    )
+    return await _render(
+        request, user, session, "hotels.html", hotels=hotels, target_counts=target_counts, q=q or ""
+    )
+
+
+@router.get("/hotels/{hotel_id}", response_class=HTMLResponse)
+async def hotel_detail(
+    request: Request, hotel_id: int, user: DashUser, session: DbSession
+):
+    if user is None:
+        return _redirect_to_login(request)
+
+    hotel = await session.get(Hotel, hotel_id)
+    if not owns(hotel, user):
+        # Same redirect for "no such hotel" and "not yours". A distinct
+        # "forbidden" page would confirm the id belongs to a real property
+        # somebody is watching.
+        return RedirectResponse(url="/hotels", status_code=303)
+
+    sources = (
+        await session.execute(
+            select(HotelSource, Source)
+            .join(Source, HotelSource.source_id == Source.id)
+            .where(HotelSource.hotel_id == hotel_id)
+        )
+    ).all()
+    rooms = (
+        await session.scalars(
+            select(RoomType)
+            .where(RoomType.hotel_id == hotel_id)
+            .order_by(RoomType.sort_order, RoomType.name)
+        )
+    ).all()
+    targets = (
+        await session.scalars(
+            select(MonitorTarget)
+            .join(HotelSource, MonitorTarget.hotel_source_id == HotelSource.id)
+            .where(HotelSource.hotel_id == hotel_id)
+        )
+    ).all()
+    # TONIGHT ONLY -- the same rule the hotels list and the matrix already use.
+    #
+    # Every target is a rolling one-night window, so a fresh series is created
+    # each day and yesterday's is frozen at whatever the last check before
+    # check-in found. Unfiltered and sorted oldest-first, this table therefore
+    # led with the oldest night on record: days stale, and disagreeing with the
+    # hotel's own booking page. That is the failure this product exists to
+    # catch, showing up on its own dashboard.
+    #
+    # Restricting the screen to today is what makes every number on it
+    # checkable against the hotel's site right now. Past nights are not
+    # deleted -- the history is in price_observations, and the Changes screen
+    # still reports last night's closing price against tonight's opening one.
+    today = local_today(get_settings().timezone)
+    prices = (
+        await session.execute(
+            select(PriceSeries, RoomType.name)
+            .join(RoomType, PriceSeries.room_type_id == RoomType.id)
+            .where(PriceSeries.hotel_id == hotel_id, PriceSeries.check_in == today)
+            .order_by(RoomType.sort_order, PriceSeries.adults)
+            .limit(100)
+        )
+    ).all()
+
+    show_with_tax = await _show_prices_with_tax(session)
+
+    # ONE ROW PER ROOM, as on the matrix and the comparison grid. This table
+    # is "tonight's prices", and a room sold room-only, with breakfast and
+    # with dinner filed three rows of it -- one tracked on two sites, six --
+    # every one under the same room's name:
+    #
+    #     Classic Room  Breakfast   5,316
+    #     Classic Room  Room Only   4,040
+    #     Classic Room  Room Only   3,454.99
+    #
+    # which reads as three Classic Rooms. The entry price is the figure the
+    # rest of the system compares on, so it is the one this page shows too.
+    # See price_display.entry_offers; the same rule decides all three screens.
+    # On the repricing board when this is your property or the benchmark, so
+    # the room reads here what it reads on /repricing.
+    board = (await _repricing_boards(session, hotel.owner_user_id)).get(hotel.id) \
+        if hotel.owner_user_id else None
+    prices = entry_offers(
+        prices, show_with_tax,
+        key=lambda row: getattr(row[0], "room_type_id", None)
+        or " ".join(str(row[1] or "").split()).casefold(),
+        series_of=lambda row: row[0],
+        board_of=(lambda row: board) if board else None,
+    )
+
+    unlisted_keys = unlisted_offer_keys([row[0] for row in prices])
+
+    # Keyed by offer_key rather than folded into the rows above, so the tuple
+    # shape the rest of this handler reads stays what it was.
+    shown_prices = {
+        series.offer_key: displayed_price(series, show_with_tax) for series, _ in prices
+    }
+
+    # Whether anything was ever collected for another night, so a hotel that has
+    # stopped collecting says so instead of falling back to the first-run setup
+    # path and looking like it was never configured.
+    had_past_prices = bool(
+        await session.scalar(
+            select(func.count())
+            .select_from(PriceSeries)
+            .where(PriceSeries.hotel_id == hotel_id, PriceSeries.check_in != today)
+        )
+    )
+    runs = (
+        await session.scalars(
+            select(CheckRun)
+            .where(CheckRun.monitor_target_id.in_([t.id for t in targets] or [0]))
+            .order_by(CheckRun.started_at.desc())
+            .limit(10)
+        )
+    ).all()
+
+    # Every source, so the "attach a source" form can offer a dropdown. A
+    # source that is not yet ToS-reviewed is still listed but flagged, because
+    # attaching it is legitimate — it just will not be fetched until reviewed.
+    all_sources = (await session.scalars(select(Source).order_by(Source.code))).all()
+    attached_ids = {hs.source_id for hs, _ in sources}
+
+    # The deployment default, so the per-hotel panel can show what this hotel
+    # would inherit if its override were switched off.
+    stored_defaults = await session.get(AlertDefaults, 1)
+    if stored_defaults is None:
+        current = monitoring_service.default_thresholds()
+        stored_defaults = SimpleNamespace(
+            min_delta_abs=current.min_delta_abs,
+            min_delta_pct=current.min_delta_pct,
+            confirm_checks=current.confirm_checks,
+        )
+    alert_defaults = stored_defaults
+
+    return await _render(
+        request, user, session, "hotel_detail.html",
+        alert_defaults=alert_defaults,
+        hotel=hotel, sources=sources, rooms=rooms, targets=targets,
+        prices=prices, unlisted_keys=unlisted_keys, runs=runs, now=datetime.now(UTC),
+        shown_prices=shown_prices, show_with_tax=show_with_tax,
+        all_sources=all_sources, attached_ids=attached_ids,
+        today=today, had_past_prices=had_past_prices,
+        known_engines=known_engines(),
+    )
+
+
+# -- retired screens -------------------------------------------------
+# Kept as redirects rather than deleted: an operator with a bookmark should
+# land somewhere useful, not on a 404 that looks like a broken deploy.
+@router.get("/health-tab")
+async def health_tab_redirect():
+    return RedirectResponse(url="/attention", status_code=307)
+
+
+@router.get("/unmatched")
+async def unmatched_redirect():
+    return RedirectResponse(url="/attention", status_code=307)
+
+
+@router.get("/targets")
+async def targets_redirect():
+    """Per-hotel monitoring lives on the hotel page; problems live in Attention."""
+    return RedirectResponse(url="/hotels", status_code=307)
+
+
+# -- sources (no longer in the nav; engine is detected from the URL) --
+@router.get("/sources", response_class=HTMLResponse)
+async def sources_page(request: Request, user: DashUser, session: DbSession):
+    """Booking platforms, and their Terms of Service reviews.
+
+    A source is a platform, not a hotel: a dozen properties can share one eZee
+    or one OTA. Configuring the selectors once here is what makes adding the
+    twelfth hotel on that platform a thirty-second job.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    rows = (await session.scalars(select(Source).order_by(Source.code))).all()
+    counts = dict(
+        (
+            await session.execute(
+                select(HotelSource.source_id, func.count(HotelSource.id))
+                .group_by(HotelSource.source_id)
+            )
+        ).all()
+    )
+    from app.adapters import registry
+
+    return await _render(
+        request, user, session, "sources.html",
+        sources=rows, counts=counts, adapter_keys=registry.available_keys(),
+    )
+
+
+# -- changes feed ----------------------------------------------------
+@router.get("/changes", response_class=HTMLResponse)
+async def changes_page(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    hotel_id: BlankableInt = None,
+    hours: int = Query(default=48, ge=1, le=720),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+):
+    """Confirmed changes, filtered by hotel and by time.
+
+    Two ways to say "when", because they answer different questions. The
+    rolling window is for "what has moved lately" and is what the page opens
+    with; explicit dates are for "what happened on the day that guest
+    complained", which a 48-hour preset cannot express at all once the day is
+    three weeks back.
+
+    Explicit dates WIN when given: a page showing both controls and quietly
+    obeying the other one is worse than either.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    from_date = _parse_date(date_from)
+    to_date = _parse_date(date_to)
+    rows = await _changes_rows(session, user, hotel_id, hours, from_date, to_date, limit=300)
+    hotels = (
+        await session.scalars(
+            select(Hotel)
+            .where(Hotel.is_active.is_(True), Hotel.owner_user_id == user.id)
+            .order_by(Hotel.name)
+        )
+    ).all()
+
+    return await _render(
+        request, user, session, "changes.html",
+        changes=rows, hotels=hotels, hotel_id=hotel_id, hours=hours,
+        date_from=from_date.isoformat() if from_date else "",
+        date_to=to_date.isoformat() if to_date else "",
+        delivery=await _delivery_state(session, [row[0] for row in rows]),
+    )
+
+
+@router.get("/changes/export")
+async def changes_export(
+    request: Request,
+    user: DashUser,
+    session: DbSession,
+    hotel_id: BlankableInt = None,
+    hours: int = Query(default=48, ge=1, le=720),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+):
+    """Download every confirmed change in the page's window as an Excel file.
+
+    Same filters as the page, but with no row limit and every meal plan, one
+    change per row. Prices and deltas are written as numbers, not text, so
+    the sheet can be sorted, filtered and summed.
+    """
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    if user is None:
+        return _redirect_to_login(request)
+
+    from_date = _parse_date(date_from)
+    to_date = _parse_date(date_to)
+    rows = await _changes_rows(
+        session, user, hotel_id, hours, from_date, to_date, limit=None, every_board=True
+    )
+    delivery = await _delivery_state(session, [row[0] for row in rows])
+    tz = ZoneInfo(get_settings().timezone)
+
+    def local(moment):
+        # Excel has no timezone; write the wall-clock time the page shows.
+        return moment.astimezone(tz).replace(tzinfo=None) if moment else None
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Price Changes"
+    ws.freeze_panes = "A2"
+
+    headers = [
+        ("Price moved", 17), ("Confirmed", 17), ("Hotel", 28), ("Room", 32),
+        ("Meal plan", 18), ("Check-in", 12), ("Check-out", 12), ("Compared", 14),
+        ("Was", 12), ("Now", 12), ("Change", 12), ("Change %", 10),
+        ("Direction", 16), ("Currency", 9), ("Alert", 16),
+    ]
+    hdr_font = Font(bold=True, color="FFFFFF")
+    hdr_fill = PatternFill("solid", fgColor="1F3864")
+    up_font = Font(color="B42318")
+    down_font = Font(color="067647")
+    for col, (label, width) in enumerate(headers, start=1):
+        c = ws.cell(row=1, column=col, value=label)
+        c.font = hdr_font
+        c.fill = hdr_fill
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.column_dimensions[get_column_letter(col)].width = width
+
+    directions = {
+        "increase": "up", "decrease": "down",
+        "became_unavailable": "sold out", "became_available": "back on sale",
+    }
+    for r, (change, hotel_name, room_name, check_in, check_out, meal_plan, _) in enumerate(
+        rows, start=2
+    ):
+        direction = getattr(change.direction, "value", str(change.direction))
+        signed = None
+        if change.delta is not None:
+            signed = -abs(change.delta) if direction == "decrease" else abs(change.delta)
+        pct = None
+        if change.delta_pct is not None:
+            pct = (-abs(change.delta_pct) if direction == "decrease" else abs(change.delta_pct)) / 100
+        values = [
+            local(change.first_seen_at or change.changed_at),
+            local(change.changed_at),
+            hotel_name,
+            room_name or "",
+            meal_plan or "",
+            check_in,
+            check_out,
+            "vs last night" if change.previous_offer_key else "same night",
+            change.old_price,
+            None if direction == "became_unavailable" else change.new_price,
+            signed,
+            pct,
+            directions.get(direction, direction),
+            change.currency,
+            delivery.get(change.id, ("",))[0],
+        ]
+        for col, value in enumerate(values, start=1):
+            ws.cell(row=r, column=col, value=value)
+        for col in (1, 2):
+            ws.cell(row=r, column=col).number_format = "dd mmm yyyy hh:mm"
+        for col in (6, 7):
+            ws.cell(row=r, column=col).number_format = "dd mmm yyyy"
+        for col in (9, 10, 11):
+            ws.cell(row=r, column=col).number_format = "#,##0.00"
+        ws.cell(row=r, column=12).number_format = "0.0%"
+        if direction in ("increase", "decrease"):
+            font = up_font if direction == "increase" else down_font
+            ws.cell(row=r, column=11).font = font
+            ws.cell(row=r, column=12).font = font
+
+    if rows:
+        ws.auto_filter.ref = ws.dimensions
+
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    if from_date or to_date:
+        span = f"{from_date or 'start'}-to-{to_date or 'today'}"
+    else:
+        span = f"last-{hours}h" if hours < 168 else f"last-{hours // 24}d"
+    fname = f"price-changes-{span}.xlsx"
+    if hotel_id:
+        hotel_obj = await session.get(Hotel, hotel_id)
+        if hotel_obj:
+            slug = "-".join(hotel_obj.name.lower().split())
+            fname = f"price-changes-{slug}-{span}.xlsx"
+
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+async def _changes_rows(
+    session, user, hotel_id, hours, from_date, to_date, *, limit, every_board=False
+):
+    """The Changes page's rows, shared with its Excel export so the two never disagree.
+
+    ``limit=None`` returns the whole window -- the export's job is every row,
+    where the page stops at what a screen can usefully show. ``every_board``
+    keeps all of a room's meal plans: the spreadsheet prints the plan in its
+    own column, so three rows there read as three prices, not as a repeat.
+    """
+    tz = ZoneInfo(get_settings().timezone)
+    statement = scope_hotels(
+        select(PriceChange, Hotel.name, RoomType.name, PriceSeries.check_in,
+               PriceSeries.check_out, PriceSeries.meal_plan, PriceSeries.room_type_id)
+        .join(Hotel, PriceChange.hotel_id == Hotel.id)
+        .outerjoin(PriceSeries, PriceChange.offer_key == PriceSeries.offer_key)
+        .outerjoin(RoomType, PriceSeries.room_type_id == RoomType.id),
+        user,
+    )
+    if from_date or to_date:
+        # Dates are read in the hotel's timezone, not the server's. A person
+        # asking for "19 Aug" means their 19 Aug, and the stored timestamps are
+        # UTC -- so a naive comparison quietly loses the last five and a half
+        # hours of the day here.
+        if from_date:
+            start = datetime.combine(from_date, time.min, tzinfo=tz)
+            statement = statement.where(PriceChange.changed_at >= start)
+        if to_date:
+            end = datetime.combine(to_date, time.min, tzinfo=tz) + timedelta(days=1)
+            statement = statement.where(PriceChange.changed_at < end)
+    else:
+        statement = statement.where(
+            PriceChange.changed_at >= datetime.now(UTC) - timedelta(hours=hours)
+        )
+
+    if hotel_id is not None:
+        statement = statement.where(PriceChange.hotel_id == hotel_id)
+
+    statement = statement.order_by(PriceChange.changed_at.desc())
+    if limit is not None:
+        statement = statement.limit(limit)
+    rows = (await session.execute(statement)).all()
+    if every_board:
+        return rows
+    # ONE ROW PER ROOM, NOT PER RATE PLAN.
+    #
+    # A reprice moves a room's three boards together and writes three changes,
+    # which is right -- they are three prices. Printed as three rows under a
+    # column that names no board, they read as the detector having repeated
+    # itself, and were reported as exactly that. See services/room_moves.py
+    # for the board that survives and why a room is never dropped.
+    #
+    # Collapsed after the query, not in it: the limit is on the changes, so
+    # narrowing it to one board in SQL would silently shorten the window a
+    # busy hotel can look back over.
+    return room_moves.one_per_room(
+        (((row[0].hotel_id, row[6]), row[5], row) for row in rows),
+        board=await session.scalar(repricing_data.pinned_board_stmt(user.id)),
+    )
+
+
+def _parse_date(raw: str | None) -> date | None:
+    """An unparseable date is ignored rather than raising a 422 at someone."""
+    if not raw:
+        return None
+    try:
+        return date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+
+
+async def _delivery_state(session, changes) -> dict[int, tuple[str, str]]:
+    """Did anyone actually hear about each change? (label, css class).
+
+    ``price_changes.notified`` cannot answer this. The dispatcher sets it even
+    when NO recipient is assigned to the hotel -- deliberately, so the change
+    does not reappear in every sweep forever -- which meant a column headed
+    "Told" showed "yes" for every row on an installation with no recipients at
+    all. It reported that the work was finished, and read as though somebody
+    had been informed.
+
+    So the notifications actually written are consulted instead, and the honest
+    answer is one of four: sent, still queued, failed, or nobody to tell.
+    """
+    if not changes:
+        return {}
+
+    ids = [c.id for c in changes]
+    # `&&` is PostgreSQL's array-overlap operator, reached through op() because
+    # the column is declared with the generic ARRAY type, whose comparator has
+    # no overlap(). One statement rather than one per change.
+    rows = (
+        await session.execute(
+            select(Notification.status, Notification.price_change_ids).where(
+                Notification.price_change_ids.op("&&")(
+                    sa_cast(ids, ARRAY(BigInteger))
+                )
+            )
+        )
+    ).all()
+
+    best: dict[int, str] = {}
+    rank = {"sent": 3, "delivered": 4, "queued": 2, "held": 2, "failed": 1}
+    for status, change_ids in rows:
+        name = getattr(status, "value", str(status))
+        for change_id in change_ids or []:
+            if change_id not in ids:
+                continue
+            if rank.get(name, 0) >= rank.get(best.get(change_id, ""), 0):
+                best[change_id] = name
+
+    state: dict[int, tuple[str, str]] = {}
+    for change in changes:
+        name = best.get(change.id)
+        if name in ("sent", "delivered"):
+            state[change.id] = ("sent", "pill-ok")
+        elif name == "failed":
+            state[change.id] = ("failed", "pill-stop")
+        elif name is not None:
+            state[change.id] = ("queued", "pill-warn")
+        elif change.notified:
+            # Processed, with nobody assigned to hear it. The dispatcher now
+            # records WHICH of the three reasons applied, because they need
+            # three different fixes -- assign somebody, reactivate them, or
+            # lower a threshold. Older rows predate the column and fall back to
+            # the vague answer rather than to a guessed specific one.
+            reason = getattr(change, "suppressed_reason", None)
+            state[change.id] = (
+                SUPPRESSION_LABELS.get(reason, "no one to tell"),
+                "pill-off",
+            )
+        else:
+            state[change.id] = ("pending", "pill-pending")
+    return state
+
+
+# -- in-app change popups --------------------------------------------
+@router.get("/changes/recent")
+async def changes_recent(
+    user: DashUser,
+    session: DbSession,
+    since_id: BlankableRowId = None,
+    limit: int = Query(default=8, ge=1, le=25),
+) -> JSONResponse:
+    """Confirmed changes newer than ``since_id``, for the on-screen popup.
+
+    WHY A CURSOR AND NOT ``price_changes.notified``
+    ===============================================
+    ``notified`` belongs to the email/WhatsApp dispatcher, which sets it even
+    when no recipient is assigned to the hotel. Reading it here would put the
+    popup and the dispatcher in a race over one flag, and whichever ran first
+    would silence the other. A cursor held by the browser keeps them
+    independent: switching notifications on later changes nothing here, and a
+    change can legitimately be shown on two screens at once.
+
+    The first poll of a browser sends no cursor and is answered with the
+    current head and nothing else, so opening the dashboard after a busy night
+    does not stack up forty toasts nobody asked for.
+    """
+    if user is None:
+        # 401 rather than the usual redirect: this is fetched, not navigated
+        # to, and an HTML login form parsed as JSON is a confusing dead end.
+        return JSONResponse({"detail": "not authenticated"}, status_code=401)
+
+    mine = owned_hotel_ids(user)
+    head = await session.scalar(
+        select(func.max(PriceChange.id)).where(PriceChange.hotel_id.in_(mine))
+    ) or 0
+    if since_id is None or since_id >= head:
+        return JSONResponse({"cursor": head, "alerts": [], "more": 0})
+
+    rows = (
+        await session.execute(
+            select(PriceChange, Hotel.name, RoomType.name, PriceSeries.check_in,
+                   PriceSeries.check_out)
+            .join(Hotel, PriceChange.hotel_id == Hotel.id)
+            .outerjoin(PriceSeries, PriceChange.offer_key == PriceSeries.offer_key)
+            .outerjoin(RoomType, PriceSeries.room_type_id == RoomType.id)
+            .where(
+                PriceChange.id > since_id,
+                PriceChange.id <= head,
+                PriceChange.hotel_id.in_(mine),
+            )
+            .order_by(PriceChange.id.desc())
+            .limit(limit)
+        )
+    ).all()
+    total = await session.scalar(
+        select(func.count(PriceChange.id)).where(
+            PriceChange.id > since_id,
+            PriceChange.id <= head,
+            PriceChange.hotel_id.in_(mine),
+        )
+    ) or 0
+
+    return JSONResponse(
+        {
+            "cursor": head,
+            # A market-wide reprice can confirm eighty changes in one cycle.
+            # Eighty toasts is the same as none; the surplus becomes one line
+            # pointing at the Changes page.
+            "more": max(0, total - len(rows)),
+            # Oldest first: they stack downward, and reading top to bottom
+            # should follow the clock.
+            "alerts": [_popup_payload(*row) for row in reversed(rows)],
+        }
+    )
+
+
+def _popup_payload(change, hotel_name, room_name, check_in, check_out) -> dict:
+    """One toast, with every string already formatted.
+
+    Prices are rendered here rather than in JavaScript because ``money``
+    already knows about Indian digit grouping and half-rupee rates, and a
+    second implementation in the browser is a second place for ₹1,23,456 to
+    come out as ₹123,456.
+    """
+    direction = change.direction.value
+    return {
+        "id": change.id,
+        "hotel_id": change.hotel_id,
+        "hotel": hotel_name,
+        "room": room_name or "—",
+        "stay": f"{check_in} → {check_out}" if check_in and check_out else "",
+        "direction": direction,
+        "was": money(change.old_price, change.currency),
+        # Sold out is a state, not a price of zero — the same distinction the
+        # comparison state machine makes.
+        "now": (
+            "sold out"
+            if direction == "became_unavailable"
+            else money(change.new_price, change.currency)
+        ),
+        "delta": (
+            None
+            if not change.delta
+            else ("+" if direction == "increase" else "−")
+            + money(abs(change.delta), change.currency)
+        ),
+        "delta_pct": (
+            None if change.delta_pct is None else f"{abs(change.delta_pct):.1f}%"
+        ),
+        "when": _localtime(change.changed_at, "%d %b %H:%M"),
+        # An intraday move and an overnight move need different wording: "was
+        # 1,023.75" is ambiguous when the two prices belong to different
+        # nights, and a reader who assumes same-night would draw the wrong
+        # conclusion about how fast the hotel is repricing.
+        "basis": "overnight" if change.previous_offer_key else "intraday",
+        "was_label": "last night" if change.previous_offer_key else "was",
+    }
+
+
+# -- attention -------------------------------------------------------
+async def _open_errors(session, hotel_ids, *, with_hotel: bool = False) -> list[tuple]:
+    """Unresolved errors on these hotels, newest first, each with its target.
+
+    Unattributed errors stay: they name no property, and they are how a
+    source that breaks before it resolves to a hotel gets noticed at all.
+    """
+    columns = [MonitoringError, MonitorTarget] + ([Hotel.name] if with_hotel else [])
+    statement = (
+        select(*columns)
+        .outerjoin(MonitorTarget, MonitoringError.monitor_target_id == MonitorTarget.id)
+        .where(
+            MonitoringError.resolved_at.is_(None),
+            or_(MonitoringError.hotel_id.is_(None), MonitoringError.hotel_id.in_(hotel_ids)),
+        )
+        .order_by(MonitoringError.occurred_at.desc())
+        # A ceiling, not a page: open errors are a handful, and a backlog
+        # past this is a problem the first five hundred already show.
+        .limit(500)
+    )
+    if with_hotel:
+        statement = statement.outerjoin(Hotel, MonitoringError.hotel_id == Hotel.id)
+    return [tuple(row) for row in (await session.execute(statement)).all()]
+
+
+@router.get("/attention", response_class=HTMLResponse)
+async def attention_page(request: Request, user: DashUser, session: DbSession):
+    """Everything waiting on a person, in one place.
+
+    Health and Unmatched used to be separate screens listing the same kind of
+    thing: work only a human can do. Splitting them meant two tabs to check and
+    two chances to forget one.
+
+    Ordered by cost of ignoring, not by loudness. "Gone quiet" leads because a
+    target that stopped checking without failing looks perfectly healthy
+    everywhere else while the prices silently freeze.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    now = datetime.now(UTC)
+
+    target_rows = (
+        await session.execute(
+            select(MonitorTarget, Hotel.id, Hotel.name)
+            .join(HotelSource, MonitorTarget.hotel_source_id == HotelSource.id)
+            .join(Hotel, HotelSource.hotel_id == Hotel.id)
+            .where(MonitorTarget.is_enabled.is_(True), Hotel.owner_user_id == user.id)
+        )
+    ).all()
+    stale = [(t, hid, name) for t, hid, name in target_rows if t.is_stale(now)]
+    paused = [
+        (t, hid, name) for t, hid, name in target_rows
+        if t.circuit_state != CircuitState.CLOSED
+    ]
+
+    unmatched = (
+        await session.execute(
+            select(UnmatchedOffer, Hotel.id, Hotel.name, RoomType.name)
+            .join(HotelSource, UnmatchedOffer.hotel_source_id == HotelSource.id)
+            .join(Hotel, HotelSource.hotel_id == Hotel.id)
+            .outerjoin(RoomType, UnmatchedOffer.suggested_room_type_id == RoomType.id)
+            .where(UnmatchedOffer.resolved_at.is_(None), Hotel.owner_user_id == user.id)
+            .order_by(UnmatchedOffer.occurrence_count.desc())
+            .limit(100)
+        )
+    ).all()
+
+    rooms_by_hotel: dict[int, list] = {}
+    hotel_ids = {hid for _, hid, _, _ in unmatched}
+    if hotel_ids:
+        for room in (
+            await session.scalars(
+                select(RoomType)
+                .where(RoomType.hotel_id.in_(hotel_ids), RoomType.is_active.is_(True))
+                .order_by(RoomType.sort_order)
+            )
+        ).all():
+            rooms_by_hotel.setdefault(room.hotel_id, []).append(room)
+
+    errors = [
+        (error, name)
+        for error, target, name in await _open_errors(session, owned_hotel_ids(user), with_hotel=True)
+        if monitoring_service.needs_a_person(error, target, now)
+    ][:100]
+
+    by_class: dict[str, int] = {}
+    for error, _ in errors:
+        by_class[error.error_class.value] = by_class.get(error.error_class.value, 0) + 1
+
+    return await _render(
+        request, user, session, "attention.html",
+        stale=stale, paused=paused, unmatched=unmatched,
+        rooms_by_hotel=rooms_by_hotel, errors=errors, by_class=by_class, now=now,
+    )
+
+
+# -- notifications ---------------------------------------------------
+@router.get("/notifications", response_class=HTMLResponse)
+async def notifications_page(
+    request: Request, user: DashUser, session: DbSession, hours: int = 168,
+    log: str = "changes", day: str | None = None,
+):
+    """What was actually sent.
+
+    Who receives alerts moved to /settings. The two were one page while there
+    were only a handful of recipients, and the delivery history -- the thing
+    somebody opens when a hotel says it never heard -- sat below three hundred
+    lines of setup forms they were not looking for.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    rows = (
+        await session.execute(
+            select(Notification, Recipient.name, Hotel.name)
+            .join(Recipient, Notification.recipient_id == Recipient.id)
+            .outerjoin(Hotel, Notification.hotel_id == Hotel.id)
+            .where(
+                Notification.created_at >= since,
+                Notification.hotel_id.in_(owned_hotel_ids(user)),
+            )
+            .order_by(Notification.created_at.desc())
+            .limit(300)
+        )
+    ).all()
+
+    # The repricer's log, under the delivery history: both answer the same
+    # question -- what went out, and on whose authority -- and the log used to
+    # sit at the bottom of /repricing, under the rule and the mapping forms
+    # somebody reading it is not touching.
+    #
+    # CHANGES ONLY, BY DEFAULT. Every 30 minutes the rule decides about every
+    # room, and nearly every decision is "unchanged" or "held"; the few that
+    # moved a rate -- the ones somebody opens this to find -- were buried. The
+    # full log is one click away. A day narrows either view to that local
+    # date; a blank or malformed one is simply no filter.
+    changes_only = log != "all"
+    try:
+        log_day = date.fromisoformat(day) if day else None
+        if log_day is not None:
+            repricing_data.local_day_bounds(log_day, get_settings().timezone)
+    except (ValueError, OverflowError):
+        # 0001-01-01 and 9999-12-31 are valid dates whose day has no edge
+        # in UTC to convert to.
+        log_day = None
+    actions = (
+        await session.scalars(repricing_data.log_stmt(
+            user.id, changes_only=changes_only, day=log_day,
+            tz=get_settings().timezone, limit=500 if log_day else 60,
+        ))
+    ).all()
+
+    return await _render(
+        request, user, session, "notifications.html",
+        notifications=rows, hours=hours, actions=actions,
+        changes_only=changes_only, log_day=log_day,
+    )
+
+
+def _people_not_just_numbers(recipients, assignments) -> list:
+    """The recipients table's rows: the people, not the alert numbers.
+
+    A NUMBER IS NOT A PERSON, AND THE TABLE MUST NOT LIST IT AS ONE
+    ===============================================================
+    Both panels write to ``recipients`` -- an alert number is a recipient
+    wearing ``alerts_all_hotels``, which is what lets it reuse the digest, the
+    dedupe and the delivery history. So a number typed into the box at the top
+    of the page also arrived in the table below it: a second row for something
+    already listed six inches higher, with an empty "Hotels covered" column
+    and the ``none`` badge on it.
+
+    That badge means *this person receives nothing*, and on an alert number it
+    is the exact opposite of the truth -- it receives everything, on every
+    hotel, including hotels added later. The one row on the page that cannot
+    be silent was the one flagged as silent.
+
+    The exception is somebody who is both: registered here, assigned to
+    hotels, and later added upstairs as a number too. They still have
+    assignments that only this table can edit, and dropping their row would
+    hide a person who is being messaged behind a panel that cannot show a
+    single one of their hotels. So the rule is about what the row IS rather
+    than which flag it carries -- no assignment of its own means it is only a
+    number -- and settings.html marks the ones that are both.
+
+    A REMOVED NUMBER IS STILL NOT A PERSON
+    ======================================
+    Removal deactivates rather than deletes, so the delivery history stays
+    answerable and re-adding the number reconnects to the same row. It leaves
+    ``alerts_all_hotels`` set, and this reads the flag without asking whether
+    the row is active -- otherwise a number somebody added and then removed
+    arrived in this table as an inactive recipient with no email, no hotels
+    and the ``none`` badge, which is how a list of people fills up with the
+    ghosts of numbers.
+    """
+    return [
+        r for r in recipients
+        if assignments.get(r.id) or not r.alerts_all_hotels
+    ]
+
+
+# -- rate application ------------------------------------------------
+@router.get("/rate-application", response_class=HTMLResponse)
+async def rate_application_page(request: Request, user: DashUser, session: DbSession):
+    """Where the owner's own rate is set, and the login that opens it.
+
+    The row is the caller's, looked up by their id and never by a parameter:
+    this page shows one owner's login to one owner's application, and there
+    is nothing in the URL to point it at anybody else's.
+
+    The password is not in the context at all. The template describes it as
+    set or not set, which is everything a form that never shows it back
+    needs, and a value that is not handed to the renderer cannot leak through
+    a template mistake.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    # The window between deploying this code and running its migration. An
+    # empty form with a note beats a 500 that reads as the page being broken,
+    # and a save in that window fails with the real reason from the API.
+    try:
+        row = await session.scalar(
+            select(RateApplication).where(RateApplication.owner_user_id == user.id)
+        )
+    except ProgrammingError:
+        await session.rollback()
+        row = None
+    app = (
+        SimpleNamespace(
+            login_url=row.login_url,
+            client_number=row.client_number,
+            username=row.username,
+            has_password=bool(row.encrypted_password),
+            updated_at=row.updated_at,
+            last_test_at=row.last_test_at,
+            last_test_ok=row.last_test_ok,
+            last_test_message=row.last_test_message,
+            has_screenshot=bool(row.last_test_screenshot),
+            session_state_saved_at=row.session_state_saved_at,
+        )
+        if row is not None
+        else None
+    )
+    return await _render(request, user, session, "rate_application.html", app=app)
+
+
+@router.get("/repricing", response_class=HTMLResponse)
+async def repricing_page(request: Request, user: DashUser, session: DbSession):
+    """Tonight's proposals, the rule that made them, the room mapping, and the log.
+
+    The proposals are computed here from the same rows the comparison page
+    reads, for tonight in the hotel's timezone -- the night the RMS grid's
+    first column is. What the page shows as "proposed" is exactly what
+    Apply would set, less the RMS conversion that needs the grid read.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    settings = await session.scalar(
+        select(RepricingSettings).where(RepricingSettings.owner_user_id == user.id)
+    )
+    if settings is None:
+        settings = RepricingSettings(owner_user_id=user.id)
+        session.add(settings)
+        await session.commit()
+        await session.refresh(settings)
+
+    own = (
+        await session.scalars(
+            select(Hotel).where(
+                Hotel.owner_user_id == user.id, Hotel.is_own_property.is_(True), Hotel.is_active.is_(True)
+            ).order_by(Hotel.name)
+        )
+    ).first()
+    rooms = (
+        await session.scalars(
+            select(RoomType).where(RoomType.hotel_id == own.id, RoomType.is_active.is_(True))
+            .order_by(RoomType.sort_order, RoomType.name)
+        )
+    ).all() if own else []
+    mappings = {
+        m.room_type_id: m
+        for m in (await session.scalars(
+            select(RmsRoomMapping).where(RmsRoomMapping.owner_user_id == user.id)
+        )).all()
+    }
+
+    # Who the owner may benchmark the AI against, and who they have. Their own
+    # property is not in the list: a benchmark against yourself is a gap of
+    # zero. Read from the same list the picker offers, so a benchmark that has
+    # since been deactivated shows as "the market" here exactly as the worker
+    # treats it, rather than naming a hotel nothing is being compared with.
+    competitors = (
+        await session.scalars(
+            select(Hotel).where(
+                Hotel.owner_user_id == user.id, Hotel.is_active.is_(True),
+                Hotel.is_own_property.is_(False),
+            ).order_by(Hotel.name)
+        )
+    ).all()
+    benchmark = next((c for c in competitors if c.id == settings.benchmark_hotel_id), None)
+    # The rooms the owner may pair against, by name. Names and not ids: the
+    # rule re-matches by name every night, so what is offered here has to be
+    # the same thing it will look for.
+    benchmark_rooms = (
+        await session.scalars(
+            select(RoomType.name).where(
+                RoomType.hotel_id == benchmark.id, RoomType.is_active.is_(True)
+            ).order_by(RoomType.name)
+        )
+    ).all() if benchmark else []
+
+    check_in = local_today(get_settings().timezone)
+    check_out = check_in + timedelta(days=1)
+    proposals = []
+    if own:
+        # Our side from the main channel's own site, as the worker reads it.
+        rows = repricing_data.lane_rows(await _priced_rows(session, user, check_in, check_out, 2),
+                                        own.id, repricing_data.main_lane(settings))
+        enabled = {rt for rt, m in mappings.items() if m.is_enabled}
+        own_rule = repricing_rule.Rule.from_row(settings)
+        # The same statement the worker runs, so the page cannot show a
+        # proposal the Apply behind it would compute differently.
+        rule_benchmark = repricing_data.benchmark_for(
+            (await session.execute(
+                repricing_data.benchmark_stmt(user.id, settings.benchmark_hotel_id)
+            )).first() if settings.benchmark_hotel_id else None,
+            settings,
+        )
+        if rule_benchmark is not None:
+            rule_benchmark = repricing_data.with_previous(rule_benchmark, (await session.execute(
+                repricing_data.previous_readings_stmt(rule_benchmark.hotel_id, check_in, check_out)
+            )).all())
+        history = [] if rule_benchmark else repricing_data.one_night((await session.execute(
+            repricing_data.history_stmt(user.id, check_in)
+        )).all())
+        proposals = repricing_rule.propose(
+            rows, own_hotel_id=own.id, rule=own_rule,
+            room_type_ids=enabled or None,
+            usual=None if rule_benchmark else repricing_rule.usual_gaps(
+                history, own_hotel_id=own.id, min_competitors=own_rule.min_competitors),
+            night=check_in,
+            benchmark=rule_benchmark,
+            moved_today=set(await session.scalars(repricing_data.moved_stmt(user.id, check_in, settings.channel))),
+        )
+
+    # The last RMS reading per rate row, so the page can show the RMS
+    # number a proposal would become without opening a browser.
+    # The last RMS reading per rate row: ``latest_rms`` for the main channel
+    # (the rows the rule writes), ``channel_rms`` for every other channel,
+    # keyed ``(channel, rms_room, rate_type)``. Read from the last week of
+    # rows rather than the log on /notifications: one Preview reads every
+    # channel and would push the main channel's figures out of a short log.
+    #
+    # ONE NIGHT'S CELLS, AND ONLY THAT NIGHT'S.
+    #
+    # The RMS grid is a cell PER DATE, and ``read_rate(..., day_index=0)``
+    # reads tonight's column. This query had no ``check_in`` filter, so the
+    # key ``(rms_room, rate_type)`` collapsed every night into one entry and
+    # the newest row won whatever night it was about. That is harmless while
+    # the page is open on the day it was written and wrong the moment the
+    # date rolls over.
+    #
+    # On 23 Sep it showed as two rooms "held, below this room's RMS floor"
+    # with nothing whatever having changed: our price (7,586 / 7,140) and
+    # Competitor A's (4,636 / 5,316) were to the rupee what they were when the
+    # same rooms applied cleanly at 10:16 the night before. What the page
+    # had was 22 SEPTEMBER's cells -- DELUXE 5,082 and CLASSIC 5,844, the
+    # rates that run had just written -- offered as tonight's. Dividing by a
+    # rate that already contains yesterday's cut proposes the cut a second
+    # time: 5,082 -> 3,040, under a 4,900 floor the true 8,500 clears
+    # comfortably. The suites were worse, still showing 17-18 Sep.
+    #
+    # ``ratio_base`` below has always filtered on the night, which is why
+    # the guard against exactly this double cut went empty at midnight and
+    # stopped guarding: the two halves disagreed about which night they
+    # were describing. They now agree, and a night nothing has read simply
+    # has no reading -- which the row says ("read the grid first"), instead
+    # of inventing one from yesterday. Preview fills it in.
+    latest_rms: dict[tuple[str, str], object] = {}
+    channel_rms: dict[tuple[str, str, str], object] = {}
+    readings = (
+        await session.scalars(
+            select(RepricingAction).where(
+                RepricingAction.owner_user_id == user.id,
+                RepricingAction.rms_room.isnot(None),
+                RepricingAction.rms_rate_type.isnot(None),
+                RepricingAction.check_in == check_in,
+                RepricingAction.created_at >= datetime.now(UTC) - timedelta(days=7),
+            ).order_by(RepricingAction.created_at.desc()).limit(2000)
+        )
+    ).all()
+    for a in reversed(readings):
+        # A WRITE THAT WAS PUT BACK LEFT THE CELL AT WHAT IT HELD BEFORE IT.
+        #
+        # ``applied_rms`` is what we typed; on a reverted row it is precisely
+        # the number no longer in the grid, and believing it made the page
+        # compute every proposal from a rate that had been undone. On 22 Sep
+        # that showed as two rooms held "below the RMS floor": the ratio was
+        # taken against 5,738 when the cell was back at 8,500, so the rule
+        # proposed 3,873 where the truth was 5,082 -- a third too low, and
+        # under a floor the real number clears comfortably.
+        value = a.current_rms if a.status == "reverted" else (a.applied_rms or a.current_rms)
+        if value is None:
+            continue
+        if a.channel in (None, settings.channel):
+            latest_rms[(a.rms_room, a.rms_rate_type)] = value
+        else:
+            channel_rms[(a.channel, a.rms_room, a.rms_rate_type)] = value
+    # THE SITE LAGS OUR OWN WRITE, AND THE RATIO MUST NOT BE TAKEN ACROSS IT.
+    #
+    # A target becomes an RMS rate by dividing by our own guest price, and the
+    # two have to be of the same moment. In the minutes after an Apply they
+    # are not: the grid holds the new rate and Booking.com still shows what
+    # the OLD one produced. Pairing them gave the owner this, seconds after a
+    # run that had just landed perfectly:
+    #
+    #     IN RMS  5,082 -> 3,038      held, below this room's RMS floor 4,900
+    #
+    # -- a second cut of the same size, proposed off a price that already
+    # included the first. The worker has refused this since this morning; the
+    # page was still drawing it, so the screen contradicted the run.
+    #
+    # So the ratio is taken against the rate the cell held BEFORE our last
+    # write, for as long as our own price is still the one that write was
+    # computed from. The moment the site catches up, ``our_price`` changes,
+    # this stops matching, and the live reading takes over again.
+    by_room = {p.room_type_id: p for p in proposals}
+    ratio_base: dict[tuple, object] = {}
+    for a in readings:
+        if (a.status != "applied" or a.current_rms is None or a.check_in != check_in
+                or a.channel not in (None, settings.channel)
+                or (a.rms_room, a.rms_rate_type) in ratio_base):
+            continue
+        proposal = by_room.get(a.room_type_id)
+        if proposal is not None and proposal.our_price is not None and a.our_price == proposal.our_price:
+            ratio_base[(a.rms_room, a.rms_rate_type)] = a.current_rms
+
+    other_channels = [c for c in (settings.known_channels or []) if c != settings.channel]
+
+    # ── the same follow on other channels (Agoda, Goibibo) ──
+    # Each rule's proposals by the worker's own steps: the lane's rows, the
+    # lane's benchmark, the same propose(). What a section shows is what its
+    # Apply would compute.
+    channel_rules = (await session.scalars(repricing_data.channel_rules_stmt(user.id))).all()
+    lanes = []
+    if own:
+        all_rows = await _priced_rows(session, user, check_in, check_out, 2)
+        bench_row = ((await session.execute(
+            repricing_data.benchmark_stmt(user.id, settings.benchmark_hotel_id)
+        )).first() if settings.benchmark_hotel_id else None)
+        previous_rows = ((await session.execute(
+            repricing_data.previous_readings_stmt(bench_row.id, check_in, check_out)
+        )).all() if bench_row else [])
+        since = check_in - timedelta(days=repricing_rule.HISTORY_NIGHTS)
+        for rule_row in channel_rules:
+            lane = repricing_data.extra_lane(rule_row)
+            lane_benchmark = repricing_data.with_previous(
+                repricing_data.lane_benchmark(bench_row, lane), previous_rows)
+            lane_proposals = repricing_rule.propose(
+                repricing_data.lane_rows(all_rows, own.id, lane, {r.id: r.name for r in rooms}),
+                own_hotel_id=own.id,
+                rule=repricing_rule.Rule.from_row(settings),
+                room_type_ids={rt for rt, m in mappings.items() if m.is_enabled} or None,
+                night=check_in, benchmark=lane_benchmark,
+                moved_today=set(await session.scalars(
+                    repricing_data.moved_stmt(user.id, check_in, lane.channel, main=False))),
+            ) if lane_benchmark is not None else []
+            # The names to pair with, as this site writes them: ours and the
+            # benchmark's, from what it has shown over the last fortnight.
+            async def names_on_site(hotel_id: int) -> list[str]:
+                return list((await session.scalars(
+                    select(RoomType.name).join(PriceSeries, PriceSeries.room_type_id == RoomType.id)
+                    .where(RoomType.hotel_id == hotel_id, PriceSeries.source_id == lane.source_id,
+                           PriceSeries.check_in >= since)
+                    .distinct().order_by(RoomType.name)
+                )).all())
+            lane_by_room = {p.room_type_id: p for p in lane_proposals}
+            lane_ratio: dict[tuple, object] = {}
+            for a in readings:
+                if (a.status != "applied" or a.current_rms is None or a.channel != lane.channel
+                        or (a.rms_room, a.rms_rate_type) in lane_ratio):
+                    continue
+                p = lane_by_room.get(a.room_type_id)
+                if p is not None and p.our_price is not None and a.our_price == p.our_price:
+                    lane_ratio[(a.rms_room, a.rms_rate_type)] = a.current_rms
+            lanes.append(SimpleNamespace(
+                rule=rule_row, lane=lane, proposals=lane_proposals, ratio_base=lane_ratio,
+                rms={p.room_type_id: _lane_rms(rule_row, p, mappings.get(p.room_type_id), channel_rms,
+                                               lane_ratio, settings.round_to)
+                     for p in lane_proposals},
+                our_names=await names_on_site(own.id),
+                their_names=await names_on_site(bench_row.id) if bench_row else [],
+            ))
+    lane_sources = (await session.scalars(
+        select(Source).where(Source.is_enabled.is_(True)).order_by(Source.display_name)
+    )).all()
+    unruled_channels = [c for c in other_channels if c not in {r.channel for r in channel_rules}]
+
+    # The model's latest opinion per room for tonight. SHOWN, NEVER USED:
+    # nothing on this page or in the run reads it back into a proposal.
+    advice: dict[int, RepricingAdvice] = {}
+    for a in (await session.scalars(
+        select(RepricingAdvice).where(
+            RepricingAdvice.owner_user_id == user.id, RepricingAdvice.check_in == check_in,
+        ).order_by(RepricingAdvice.created_at)
+    )).all():
+        if a.room_type_id is not None:
+            advice[a.room_type_id] = a
+
+    # What the model's position asks for BEFORE the step cap, on tonight's
+    # market. After the cap the two columns often agree to the rupee -- a
+    # market far from our price pulls both to the same one-step move -- and
+    # the disagreement the column exists to show would be invisible.
+    ai_wanted: dict[int, object] = {}
+    for p in proposals:
+        a = advice.get(p.room_type_id)
+        if a is not None and a.advisor_position_pct is not None and p.market is not None:
+            shadow = replace(own_rule, position_pct=a.advisor_position_pct)
+            wanted = repricing_rule.aim(p.market, shadow, gap=p.usual_gap or Decimal("1"),
+                                        demand_pct=p.demand_pct)
+            capped = repricing_rule.guard(p.our_price, wanted, shadow)[0] if p.our_price else wanted
+            ai_wanted[p.room_type_id] = (wanted, capped)
+
+    app_row = await session.scalar(
+        select(RateApplication).where(RateApplication.owner_user_id == user.id)
+    )
+    # Whether the automatic mode is doing anything, answered at the top of the
+    # page rather than by reading the log on /notifications.
+    last_auto_change = await session.scalar(repricing_data.last_auto_change_stmt(user.id))
+    today = local_today(get_settings().timezone)
+    auto_changes_today = await session.scalar(
+        repricing_data.auto_changes_on_stmt(user.id, today, get_settings().timezone)
+    ) or 0
+    return await _render(
+        request, user, session, "repricing.html",
+        settings=settings, own=own, rooms=rooms, mappings=mappings, proposals=proposals,
+        ratio_base=ratio_base,
+        competitors=competitors, benchmark=benchmark, benchmark_rooms=benchmark_rooms,
+        check_in=check_in, latest_rms=latest_rms, advice=advice, ai_wanted=ai_wanted,
+        channel_rms=channel_rms,
+        lanes=lanes, lane_sources=lane_sources, unruled_channels=unruled_channels,
+        has_rate_app=app_row is not None, rule=repricing_rule,
+        last_auto_change=last_auto_change, auto_changes_today=auto_changes_today, today=today,
+    )
+
+
+def _lane_rms(rule_row, p, m, channel_rms, lane_ratio, round_to) -> SimpleNamespace:
+    """One room's RMS sum under another website's rule (Agoda, Goibibo).
+
+    Shown in the website's own section only. The Booking.com table at the
+    top used to offer the website as a tick too, with a box that once carried
+    Booking.com's share and would have put Our Resort above Competitor A ON AGODA; a
+    website with a rule of its own is now priced and applied from its
+    section alone.
+
+    ``anchor`` is the plan the run scales: the mapped anchor where the channel
+    has that row, otherwise the first plan it does sell (Agoda has no EP row
+    for CLASSIC), read off what the last Preview found under the channel.
+    """
+    out = SimpleNamespace(anchor=None, cur=None, base=None, rms_new=None, bounded=None,
+                          settled=False, idle=None)
+    if m is None:
+        return out
+    channel = rule_row.channel
+    anchor = m.anchor_for(p.board or rule_row.benchmark_meal_plan)
+    if anchor and (channel, m.rms_room, m.rate_type_for(anchor)) not in channel_rms:
+        anchor = next((plan for plan in ("EP", "CP", "MAP") if m.rate_type_for(plan)
+                       and (channel, m.rms_room, m.rate_type_for(plan)) in channel_rms), anchor)
+    out.anchor = anchor
+    if anchor and (channel, m.rms_room, m.rate_type_for(anchor)) in channel_rms:
+        out.cur = channel_rms[(channel, m.rms_room, m.rate_type_for(anchor))]
+        out.base = lane_ratio.get((m.rms_room, m.rate_type_for(anchor)), out.cur)
+    if out.base is not None and p.target is not None and p.our_price:
+        out.rms_new, out.bounded = repricing_rule.within_rms_bounds(
+            repricing_rule.to_rms(p.target, p.our_price, out.base, round_to=round_to,
+                                  exact=p.exact, with_tax=p.with_tax),
+            floor=m.floor_amount, ceiling=m.ceiling_amount)
+    if p.target is not None and p.our_price:
+        out.settled = repricing_rule.settled(p.our_price, p.target, round_to=round_to)
+    if not out.settled:
+        out.idle = repricing_rule.nothing_to_write(out.cur, out.base, out.rms_new, round_to=round_to)
+    return out
+
+
+@router.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request, user: DashUser, session: DbSession):
+    """Who the system may tell, and how to reach them."""
+    if user is None:
+        return _redirect_to_login(request)
+
+    # Alert sensitivity, and the two prices that make it concrete. Both floors
+    # have to be cleared, so the same rupee amount is loud on a cheap room and
+    # silent on an expensive one -- the panel shows what it means here rather
+    # than explaining the rule in the abstract.
+    stored = await session.get(AlertDefaults, 1)
+    if stored is None:
+        current = monitoring_service.default_thresholds()
+        # Column defaults apply on INSERT, and this row is never inserted --
+        # it exists to render the page in the window between deploying the
+        # code and running its migration. Left unset the switches read None,
+        # which renders as OFF and states the opposite of the default.
+        stored = AlertDefaults(
+            id=1,
+            min_delta_abs=current.min_delta_abs,
+            min_delta_pct=current.min_delta_pct,
+            confirm_checks=current.confirm_checks,
+            show_prices_with_tax=False,
+            summary_interval_hours=2,
+            email_alerts_enabled=True,
+            whatsapp_alerts_enabled=True,
+        )
+    cheapest, dearest = (
+        await session.execute(
+            select(func.min(PriceSeries.last_price), func.max(PriceSeries.last_price))
+            .join(Hotel, Hotel.id == PriceSeries.hotel_id)
+            .where(PriceSeries.last_price.is_not(None), Hotel.owner_user_id == user.id)
+        )
+    ).one()
+    alert_defaults = SimpleNamespace(
+        min_delta_abs=stored.min_delta_abs,
+        min_delta_pct=stored.min_delta_pct,
+        confirm_checks=stored.confirm_checks,
+        show_prices_with_tax=stored.show_prices_with_tax,
+        summary_interval_hours=stored.summary_interval_hours,
+        email_alerts_enabled=stored.email_alerts_enabled,
+        whatsapp_alerts_enabled=stored.whatsapp_alerts_enabled,
+        cheapest_room=cheapest,
+        dearest_room=dearest,
+    )
+
+    recipients = (await session.scalars(select(Recipient).order_by(Recipient.name))).all()
+
+    # How much has been sent to each person, for the delete confirmation.
+    #
+    # Deleting a recipient takes their delivery history with it -- the FK is
+    # NOT NULL with ON DELETE CASCADE, so it cannot be orphaned and kept -- and
+    # a confirmation that cannot say how much that is asks people to agree to
+    # an unknown. One grouped count for the page, not one per row.
+    sent_counts = dict(
+        (
+            await session.execute(
+                select(Notification.recipient_id, func.count(Notification.id))
+                .group_by(Notification.recipient_id)
+            )
+        ).all()
+    )
+
+    # The WhatsApp alert numbers, which are recipients wearing the
+    # alerts_all_hotels flag rather than a separate kind of thing -- so they
+    # reuse the digest, the dedupe and the delivery history on /notifications.
+    alert_numbers = [r for r in recipients if r.alerts_all_hotels and r.is_active]
+
+    # Who each person actually covers. A recipient with no assignment receives
+    # nothing at all -- the dispatcher looks up hotel_recipients, not
+    # recipients -- so the page has to show the assignment, not just the row.
+    assignments: dict[int, list] = {}
+    for link, hotel_name in (
+        await session.execute(
+            select(HotelRecipient, Hotel.name)
+            .join(Hotel, HotelRecipient.hotel_id == Hotel.id)
+            .where(Hotel.owner_user_id == user.id)
+            .order_by(Hotel.name)
+        )
+    ).all():
+        assignments.setdefault(link.recipient_id, []).append((link, hotel_name))
+
+    recipients = _people_not_just_numbers(recipients, assignments)
+
+    hotels = (
+        await session.scalars(
+            select(Hotel)
+            .where(Hotel.is_active.is_(True), Hotel.owner_user_id == user.id)
+            .order_by(Hotel.name)
+        )
+    ).all()
+
+    # Only channels this deployment can actually send on. Offering WhatsApp
+    # before the access token exists produces an assignment that looks saved
+    # and fails at the first price move, which is the worst moment to find out.
+    settings = get_settings()
+
+    # How much stored past there is, and how much of it a clean would
+    # discard. Measured here rather than fetched by the page's own
+    # script so the section is complete on first paint -- a danger-zone button
+    # that appears before the numbers it is about is a button people press
+    # without them.
+    history = await retention.measure(session, settings.history_retention_months)
+
+    # Whether a market summary can reach WhatsApp at all. The page warns that
+    # it cannot, and the flag was never passed -- so an undefined name read as
+    # false and the warning stood on a deployment that had the template
+    # approved and named. A permanent warning is one nobody reads.
+    #
+    # Two conditions, because either one alone is not sending: the channel has
+    # to be configured at all, and the second template has to be named. The
+    # price-change template cannot stand in for it -- base.py refuses the
+    # substitution rather than paying for a message that reads as a real alert
+    # about a room that did not move.
+    comparison_whatsapp_ready = bool(
+        "whatsapp" in registry.available_channels()
+        and settings.whatsapp_comparison_template_name
+    )
+
+    return await _render(
+        request, user, session, "settings.html",
+        alert_defaults=alert_defaults,
+        history=history,
+        recipients=recipients, assignments=assignments, hotels=hotels,
+        sent_counts=sent_counts,
+        channels=registry.available_channels(),
+        default_quiet=(settings.quiet_hours_start, settings.quiet_hours_end),
+        alert_numbers=alert_numbers,
+        max_alert_numbers=MAX_ALERT_NUMBERS,
+        comparison_whatsapp_ready=comparison_whatsapp_ready,
+    )
+
+
+# -- targets ---------------------------------------------------------
+@router.get("/check-runs/{check_run_id}", response_class=HTMLResponse)
+async def check_run_partial(
+    request: Request, check_run_id: str, user: DashUser, session: DbSession
+):
+    """The fragment the run button polls.
+
+    A browser fetch takes 20-40 seconds, so the manual-run button gets a 202
+    and this endpoint reports progress. Returning a fragment rather than JSON
+    keeps the rendering in one place.
+    """
+    if user is None:
+        return _redirect_to_login(request)
+
+    # Scoped through the target's hotel. A run id is a uuid rather than a
+    # small integer, but "hard to guess" is not an access rule, and the
+    # fragment reports what a competitor's check found. A run with no target
+    # came from manual entry and carries no hotel to check it against.
+    run = await session.scalar(
+        select(CheckRun).where(
+            CheckRun.id == check_run_id,
+            or_(
+                CheckRun.monitor_target_id.is_(None),
+                CheckRun.monitor_target_id.in_(
+                    select(MonitorTarget.id)
+                    .join(HotelSource, MonitorTarget.hotel_source_id == HotelSource.id)
+                    .where(HotelSource.hotel_id.in_(owned_hotel_ids(user)))
+                ),
+            ),
+        )
+    )
+    return templates.TemplateResponse(
+        request=request, name="partials/check_run.html", context={"run": run}
+    )

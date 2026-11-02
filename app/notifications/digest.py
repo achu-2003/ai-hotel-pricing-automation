@@ -1,0 +1,201 @@
+"""Batching, quiet hours, and idempotency — the rules about *when* to interrupt.
+
+Pure functions, no database and no clock of their own, because these are the
+decisions most likely to be wrong in a way nobody notices until someone mutes
+the alerts.
+
+THREE PROTECTIONS
+=================
+**Digest batching.** All of one hotel's changes in a 60-second window become
+one message. A market-wide weekend reprice produces a hundred changes in one
+cycle; a hundred separate messages at 5:30 PM gets the system muted, after
+which no alert reaches anyone at all.
+
+**Quiet hours.** Anything landing between 22:00 and 07:00 local time is held
+and released in the morning. A ₹200 move at 3 AM is not worth a phone buzzing.
+Note that it is *held*, not dropped — the change is real and still gets told.
+
+**Idempotency.** ``dedupe_key`` hashes (recipient, channel, the exact set of
+change ids) and the notifications table has a unique index on it. A Celery
+retry after a provider timeout therefore cannot double-send, which matters
+because "did that actually go out?" is unanswerable at the provider level.
+"""
+from __future__ import annotations
+
+import hashlib
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+DEDUPE_VERSION = "v1"
+
+
+def dedupe_key(recipient_id: int, channel: str, change_ids: list[int]) -> str:
+    """Stable identity for "this exact alert to this exact person".
+
+    Sorted, so the same set of changes arriving in a different order produces
+    the same key. Versioned, so a future change to the batching rules does not
+    silently suppress messages that the old rules had already keyed.
+    """
+    payload = f"{DEDUPE_VERSION}|{recipient_id}|{channel}|{','.join(map(str, sorted(change_ids)))}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def ops_dedupe_key(recipient_id: int, channel: str, token: str) -> str:
+    """Identity for an operational alert, which has no change ids to hash.
+
+    ``token`` is supplied by the caller and is what decides how often the same
+    problem may interrupt someone. ``alert_on_silence`` builds it from the set
+    of stale targets plus the date, which gives "at most one message per person
+    per day, unless a *different* target goes quiet" — the alternative being a
+    message every fifteen minutes for as long as the outage lasts, which is how
+    an alert channel gets filtered to a folder nobody opens.
+
+    Namespaced away from :func:`dedupe_key` so an ops alert can never collide
+    with a price digest: both live under one unique index.
+    """
+    payload = f"{DEDUPE_VERSION}|ops|{recipient_id}|{channel}|{token}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def summary_dedupe_key(recipient_id: int, channel: str, window_start: datetime) -> str:
+    """Identity for a market summary, keyed on the WINDOW it covers.
+
+    Not on the change ids, which is what :func:`dedupe_key` uses and what the
+    first draft of this used. The summary task ticks every few minutes and
+    recomputes the last closed window each time, so it offers the same message
+    repeatedly until one is written; keyed on the window, the unique index
+    turns those repeats into one send and the task needs no state of its own.
+
+    Keyed on change ids it would also collide with a hotel's own digest
+    whenever a window happened to contain exactly that hotel's changes -- two
+    different messages, one saying a room moved and the other saying where that
+    leaves you, and the second silently swallowed as a duplicate of the first.
+
+    The window start is rendered to the second in UTC. A window is a closed,
+    clock-aligned slot, so two ticks in the same slot produce the same key and
+    two different slots cannot.
+    """
+    stamp = window_start.astimezone(UTC).strftime("%Y%m%dT%H%M%S")
+    payload = f"{DEDUPE_VERSION}|market|{recipient_id}|{channel}|{stamp}"
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def in_quiet_hours(now_local: time, start: time | None, end: time | None) -> bool:
+    """Whether ``now_local`` falls inside the quiet window.
+
+    Handles the wrap past midnight, which is the normal case: 22:00 to 07:00
+    is one window, not two, and the naive ``start <= now <= end`` comparison
+    would report it as never active.
+    """
+    if start is None or end is None or start == end:
+        return False
+    if start < end:
+        return start <= now_local < end
+    return now_local >= start or now_local < end
+
+
+def release_time(
+    now: datetime, end: time | None, tz_name: str = "Asia/Kolkata"
+) -> datetime | None:
+    """When a held message should go out: the next occurrence of ``end``.
+
+    Returned in UTC so it can be compared against a stored timestamp without
+    another timezone conversion at the point of use.
+    """
+    if end is None:
+        return None
+    zone = ZoneInfo(tz_name)
+    local = now.astimezone(zone)
+    target = datetime.combine(local.date(), end, tzinfo=zone)
+    if target <= local:
+        target = datetime.combine(local.date() + timedelta(days=1), end, tzinfo=zone)
+    return target.astimezone(now.tzinfo or zone)
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeFacts:
+    """The parts of a price change that decide whether it is worth sending.
+
+    Kept separate from ``ChangeLine`` (which is about rendering) so the
+    filtering rules can be tested without constructing a message.
+    """
+
+    change_id: int
+    hotel_id: int
+    delta: Decimal | None
+    delta_pct: Decimal | None
+    direction: str
+    #: Which room moved. Optional only so older callers and the threshold
+    #: tests, which are about sizes and not about grouping, need not invent
+    #: one; the dispatcher always supplies it.
+    room_type_id: int | None = None
+
+
+def passes_recipient_threshold(
+    facts: ChangeFacts,
+    min_delta_abs: Decimal | None,
+    min_delta_pct: Decimal | None,
+) -> bool:
+    """A second, per-person filter on top of the target's own thresholds.
+
+    The same change can be worth telling the manager of the hotel next door
+    and not worth telling someone tracking a property across the valley, so
+    sensitivity lives on the assignment as well as on the target.
+
+    Availability events always pass: "sold out" has no percentage, and it is
+    the kind of thing the assigned person wants regardless.
+    """
+    if facts.direction in {"became_unavailable", "became_available"}:
+        return True
+    if min_delta_abs is not None and (facts.delta is None or abs(facts.delta) < min_delta_abs):
+        return False
+    if min_delta_pct is not None and (
+        facts.delta_pct is None or abs(facts.delta_pct) < min_delta_pct
+    ):
+        return False
+    return True
+
+
+def group_for_digest(
+    facts: list[ChangeFacts],
+    assignments: dict[int, list[int]],
+) -> dict[tuple[int, int, int | None], list[int]]:
+    """Group changes into one batch per (recipient, hotel, room).
+
+    Args:
+        facts: the changes being dispatched.
+        assignments: ``{hotel_id: [recipient_id, ...]}``.
+
+    Grouping by hotel as well as by recipient is deliberate. Someone
+    responsible for four properties gets four messages rather than one mixed
+    digest, because each one is a different decision they might act on.
+
+    BY ROOM TOO, AND FOR THE SAME REASON ONE STEP DOWN. Two rooms of one hotel
+    moving are two decisions, and the price-change template can only name one
+    room: batched per hotel they went out as "Deluxe Double Room +3 more",
+    which named one room, priced that one, and left the other unmentioned. A
+    reader cannot act on a room they were not told about.
+
+    This does NOT undo the batching that keeps a weekend-wide reprice from
+    becoming a hundred messages. A room still moves once per window, and the
+    boards it moved on are collapsed before this is called
+    (services/room_moves.py), so the message count is the number of rooms that
+    moved -- not the number of prices that changed.
+    """
+    batches: dict[tuple[int, int, int | None], list[int]] = defaultdict(list)
+    for fact in facts:
+        for recipient_id in assignments.get(fact.hotel_id, ()):
+            batches[(recipient_id, fact.hotel_id, fact.room_type_id)].append(fact.change_id)
+    return dict(batches)
+
+
+def is_weekend_stay(check_in: date) -> bool:
+    """Friday or Saturday night.
+
+    Not used for filtering — weekend rates simply move more, and flagging them
+    keeps that visible when someone is reading a week of history.
+    """
+    return check_in.weekday() in (4, 5)

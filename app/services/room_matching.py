@@ -1,0 +1,240 @@
+"""Resolving a site's room name to a canonical room type.
+
+The hardest correctness problem in this system. Sites rename rooms
+("Deluxe Room" becomes "Deluxe Double Room with Balcony"), and no two sources
+agree on wording. Get this wrong and a price series silently splits in two, or
+worse, two different rooms get merged into one series and every comparison
+after that is meaningless.
+
+The resolution order is deliberate:
+
+1. **exact** match on the normalised name (the common path once trained)
+2. **fuzzy** match above a high threshold, recorded with its score for review
+3. **give up** and record an ``UnmatchedOffer`` for a human to map
+
+Step 3 is the important one. The system NEVER guesses below the threshold: a
+missing price for one room is a visible gap that gets fixed, while a wrong
+mapping is invisible and corrupts history indefinitely.
+
+Everything here is pure — no database, no I/O — so it is cheap to test against
+the real room names collected during the source spike.
+"""
+from __future__ import annotations
+
+import re
+import unicodedata
+from dataclasses import dataclass
+
+from rapidfuzz import fuzz
+
+# Above this, accept a fuzzy match automatically (flagged for review).
+#
+# 90, not 85. With the min-of-two-ratios score below, "super deluxe double
+# occupancy" against "deluxe double occupancy" lands at 88.5 -- close enough to
+# look like the same room, and it is not. The gap between 85 and 90 is exactly
+# where "a qualifier word was added" lives, and that is the case where guessing
+# wrong is silent and permanent. Above 90 the names are effectively identical.
+AUTO_MATCH_THRESHOLD = 90.0
+# Between this and AUTO_MATCH_THRESHOLD, record as a suggestion only.
+SUGGEST_THRESHOLD = 60.0
+
+# Words that carry no distinguishing information for a room type. "non" and
+# "ac" are deliberately absent: "Non AC Deluxe" and "AC Deluxe" are different
+# rooms at very different prices.
+_STOP_WORDS = frozenset({
+    "room", "rooms", "with", "the", "a", "an", "and", "our", "type",
+    "category", "accommodation", "stay", "unit", "in", "of", "for", "per",
+})
+
+# Expanded before stop-word removal so "dbl" and "double" collapse together.
+_ABBREVIATIONS = {
+    "dbl": "double", "sgl": "single", "trpl": "triple", "quad": "quadruple",
+    "dlx": "deluxe", "std": "standard", "exec": "executive", "sup": "superior",
+    "ste": "suite", "apt": "apartment", "bhk": "bedroom",
+    "ac": "ac", "a/c": "ac", "aircon": "ac", "airconditioned": "ac",
+    "nonac": "non ac", "non-ac": "non ac",
+    "w/": "with", "&": "and", "+": "and",
+}
+
+_PUNCT_RE = re.compile(r"[^\w\s/&+-]")
+_WS_RE = re.compile(r"\s+")
+
+def looks_like_a_field_label(raw: str | None) -> bool:
+    """Whether this is a spec-table LABEL that a selector mistook for a room.
+
+    A room-name selector does not fail by finding nothing. It fails by finding
+    the wrong element and returning it with total confidence.
+
+    Competitor B is the case. Booking.com prints each room card's bed
+    configuration as a definition list, and on 3 Sep the selector reached into
+    it: three "rooms" called "Bed:", "Bedroom:" and "Beds:" were created, each
+    with its own price series. Every screen believed the hotel had eight rooms.
+
+    THE NARROWEST RULE THAT CATCHES THEM, and narrow on purpose. A trailing
+    colon makes a string a field label rather than a value -- that is what the
+    colon is for -- and no hotel names a room with one. A colon INSIDE the name
+    is untouched, because "Deluxe Room: Garden View" is a real room described
+    in two halves.
+
+    WHAT THIS DELIBERATELY DOES NOT CLAIM
+    =====================================
+    It is not a general "is this a room name" test, and an earlier draft that
+    tried to be one broke something. That draft also rejected any name with no
+    letter in it -- "---", "2" -- which reads as an obvious improvement and is
+    not: ``normalize_room_name("---")`` is already empty, so ingest ALREADY
+    routes it to the unmatched queue, where a person can see it. Rejecting it
+    here dropped it one step earlier and one step quieter, and two integration
+    tests said so.
+
+    So the two rules divide cleanly. A name that normalises away is a name the
+    queue owns and always has. A name that normalises to something real --
+    "Beds:" becomes "beds" -- is one nothing was catching, because from there
+    on it is indistinguishable from a room the hotel has just added.
+
+    Deliberately not a keyword list either. "Bed", "Sleeps", "Size" and
+    "Occupancy" are all spec labels AND all appear inside real room names, so
+    reading the words would either miss the next site's labels or throw away
+    "Twin Bed Room". The punctuation is what carries the meaning.
+    """
+    return bool(raw) and raw.strip().endswith(":")
+
+
+def normalize_room_name(raw: str) -> str:
+    """Canonical form used as the alias lookup key.
+
+    Tokens are SORTED, so "Deluxe Double" and "Double Deluxe" resolve to the
+    same room. Room names are descriptive rather than grammatical, so word
+    order carries no meaning worth preserving.
+
+    Returns an empty string for input that normalises away entirely; callers
+    must treat that as unmatchable rather than as a valid key.
+    """
+    if not raw:
+        return ""
+
+    # Fold accents so "Suíte" and "Suite" agree.
+    text = unicodedata.normalize("NFKD", raw)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower().strip()
+
+    # Expand abbreviations before punctuation is stripped, since some of them
+    # contain punctuation ("a/c", "w/").
+    for abbr, full in _ABBREVIATIONS.items():
+        text = re.sub(rf"(?<![\w]){re.escape(abbr)}(?![\w])", f" {full} ", text)
+
+    text = _PUNCT_RE.sub(" ", text).replace("/", " ").replace("-", " ")
+    text = _WS_RE.sub(" ", text).strip()
+
+    tokens = [t for t in text.split() if t and t not in _STOP_WORDS]
+    if not tokens:
+        return ""
+    return " ".join(sorted(tokens))
+
+
+@dataclass(frozen=True, slots=True)
+class MatchCandidate:
+    room_type_id: int
+    canonical_name: str
+    score: float
+
+
+@dataclass(frozen=True, slots=True)
+class MatchResult:
+    """Outcome of resolving one raw name.
+
+    ``room_type_id is None`` means unmatched; ``suggestion`` may still hold the
+    best near-miss so the dashboard can offer a one-click mapping.
+    """
+
+    normalized: str
+    room_type_id: int | None
+    score: float | None
+    is_exact: bool
+    suggestion: MatchCandidate | None = None
+
+    @property
+    def matched(self) -> bool:
+        return self.room_type_id is not None
+
+
+def score_similarity(a: str, b: str) -> float:
+    """Similarity of two already-normalised names, 0-100.
+
+    The score is the MINIMUM of two ratios, and that choice is the whole point:
+
+    ``token_set_ratio``  ignores extra words entirely, so a superset scores 100
+    ``token_sort_ratio`` compares the full strings, so extra words cost you
+
+    Using ``token_set_ratio`` alone is actively dangerous. It rates
+    "super deluxe double occupancy" against "deluxe double occupancy" as a
+    perfect 100, because every token of the shorter name appears in the longer
+    one. Those are different rooms at very different rates -- observed on a
+    real property, where the two collapsed into one price series and only a
+    primary-key violation stopped it being written.
+
+    Taking the minimum means extra distinguishing words ("super", "premium",
+    "executive") pull the score down, so the pair falls below the automatic
+    threshold and goes to a human instead. A rename like "Deluxe Room" ->
+    "Deluxe Double Room with Balcony" also lands there: one click to map, once,
+    versus a silently corrupted series that nobody notices for months.
+    """
+    if not a or not b:
+        return 0.0
+    return float(min(fuzz.token_set_ratio(a, b), fuzz.token_sort_ratio(a, b)))
+
+
+def resolve(
+    raw_name: str,
+    *,
+    aliases: dict[str, int],
+    candidates: list[tuple[int, str]],
+    auto_threshold: float = AUTO_MATCH_THRESHOLD,
+    suggest_threshold: float = SUGGEST_THRESHOLD,
+) -> MatchResult:
+    """Resolve ``raw_name`` to a room type id.
+
+    Args:
+        aliases: ``{normalized_name: room_type_id}`` for this source, including
+            every previously confirmed manual mapping.
+        candidates: ``(room_type_id, canonical_name)`` for this hotel, used for
+            fuzzy matching when no alias exists.
+
+    The caller persists the outcome: a new alias row on a match, or an
+    ``UnmatchedOffer`` row when unmatched.
+    """
+    normalized = normalize_room_name(raw_name)
+    if not normalized:
+        return MatchResult(normalized="", room_type_id=None, score=None, is_exact=False)
+
+    # 1. Exact alias hit. Includes manual mappings, so a human decision always
+    #    wins over anything fuzzy matching might prefer.
+    if (room_type_id := aliases.get(normalized)) is not None:
+        return MatchResult(
+            normalized=normalized, room_type_id=room_type_id, score=100.0, is_exact=True
+        )
+
+    # 2. Fuzzy against this hotel's known rooms.
+    best: MatchCandidate | None = None
+    for room_type_id, canonical in candidates:
+        score = score_similarity(normalized, canonical)
+        if best is None or score > best.score:
+            best = MatchCandidate(room_type_id, canonical, score)
+
+    if best and best.score >= auto_threshold:
+        return MatchResult(
+            normalized=normalized,
+            room_type_id=best.room_type_id,
+            score=best.score,
+            is_exact=False,
+            suggestion=best,
+        )
+
+    # 3. Unmatched. Keep the near-miss as a suggestion, but do not act on it.
+    suggestion = best if best and best.score >= suggest_threshold else None
+    return MatchResult(
+        normalized=normalized,
+        room_type_id=None,
+        score=best.score if best else None,
+        is_exact=False,
+        suggestion=suggestion,
+    )

@@ -1,0 +1,1221 @@
+"""The ingest pipeline, against a real PostgreSQL.
+
+This is the code that turns adapter output into stored history and confirmed
+changes. The pure decisions inside it are already covered by the comparison and
+room-matching unit tests; what needs a real database is everything those tests
+cannot see: the ``ON CONFLICT`` upserts, the partitioned insert, ``SELECT FOR
+UPDATE`` on the series row, and the disappearance sweep.
+
+Skipped unless ``TEST_DATABASE_URL`` is set — see ``conftest.py``.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from sqlalchemy import func, select
+
+from app.adapters.base import FetchResult, NormalizedOffer
+from app.db.models import (
+    ChangeDirection,
+    PriceBasis,
+    PriceChange,
+    PriceObservation,
+    PriceSeries,
+    RoomType,
+    UnmatchedOffer,
+)
+from app.services.comparison import Outcome, Thresholds
+from app.services.dates import StayWindow
+from app.services.ingest import IngestContext, ingest_fetch_result
+
+pytestmark = pytest.mark.integration
+
+STAY = StayWindow(datetime(2026, 12, 20).date(), datetime(2026, 12, 21).date())
+
+
+def _context(
+    fixture, *, checked_at=None, confirm_checks=2, price_basis=PriceBasis.INCLUSIVE
+) -> IngestContext:
+    return IngestContext(
+        hotel_id=fixture["hotel"].id,
+        source_id=fixture["source"].id,
+        hotel_source_id=fixture["hotel_source"].id,
+        stay=STAY,
+        adults=2,
+        children=0,
+        currency="INR",
+        price_basis=price_basis,
+        thresholds=Thresholds(
+            min_delta_abs=Decimal("50"),
+            min_delta_pct=Decimal("2.0"),
+            confirm_checks=confirm_checks,
+        ),
+        checked_at=checked_at or datetime.now(UTC),
+        check_run_id=None,
+    )
+
+
+def _offer(name="Deluxe Room", price="3000", available=True, **kw) -> NormalizedOffer:
+    return NormalizedOffer(
+        raw_room_name=name,
+        price_inclusive=Decimal(price) if price is not None else None,
+        currency="INR",
+        is_available=available,
+        **kw,
+    )
+
+
+def _result(*offers, sold_out=False) -> FetchResult:
+    return FetchResult(offers=list(offers), sold_out_detected=sold_out)
+
+
+class TestFirstSighting:
+    def test_records_history_and_tells_nobody(self, session, hotel_fixture):
+        """Adding a hotel must not immediately spam its recipient."""
+        summary = ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture))
+        session.flush()
+
+        assert summary.offers_matched == 1
+        assert summary.changes_detected == 0
+        assert summary.outcomes[Outcome.FIRST_SIGHT] == 1
+
+        series = session.scalars(select(PriceSeries)).all()
+        assert len(series) == 1
+        assert series[0].last_price == Decimal("3000.00")
+
+        # The observation is written regardless: it is the history.
+        assert session.scalar(select(func.count(PriceObservation.id))) == 1
+
+    def test_offer_key_is_the_primary_key(self, session, hotel_fixture):
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture))
+        session.flush()
+        series = session.scalars(select(PriceSeries)).one()
+        assert len(series.offer_key) == 64
+
+
+class TestDebounce:
+    def test_a_move_must_persist_before_it_counts(self, session, hotel_fixture):
+        """The rule that keeps the alerts trustworthy.
+
+        Dynamic pricing and A/B tests produce one-off blips. Without the
+        confirmation requirement every blip becomes an alert, the alerts become
+        noise, and the noise gets them ignored — which is the real failure.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        # First sighting of the new price: significant, not yet confirmed.
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(price="2700")),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+        assert summary.changes_detected == 0
+        assert summary.outcomes[Outcome.PENDING_CONFIRMATION] == 1
+
+        series = session.scalars(select(PriceSeries)).one()
+        assert series.last_price == Decimal("3000.00")   # baseline is untouched
+        assert series.pending_price == Decimal("2700.00")
+
+        # Second consecutive sighting: confirmed.
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(price="2700")),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=60)),
+        )
+        session.flush()
+        assert summary.changes_detected == 1
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.old_price == Decimal("3000.00")
+        assert change.new_price == Decimal("2700.00")
+        assert change.direction.value == "decrease"
+        assert change.delta_pct == Decimal("-10.00")
+
+    def test_a_blip_that_reverts_never_alerts(self, session, hotel_fixture):
+        base = datetime.now(UTC)
+        for minutes, price in ((0, "3000"), (30, "2700"), (60, "3000")):
+            ingest_fetch_result(
+                session,
+                _result(_offer(price=price)),
+                _context(hotel_fixture, checked_at=base + timedelta(minutes=minutes)),
+            )
+            session.flush()
+
+        assert session.scalar(select(func.count(PriceChange.id))) == 0
+        series = session.scalars(select(PriceSeries)).one()
+        assert series.pending_price is None
+        assert series.pending_count == 0
+
+    def test_a_small_move_is_recorded_but_not_alerted(self, session, hotel_fixture):
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(price="2980")),   # ₹20: below both floors
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        assert summary.changes_detected == 0
+        assert summary.outcomes[Outcome.INSIGNIFICANT] == 1
+        # Still in the history, so the chart shows the wobble.
+        assert session.scalar(select(func.count(PriceObservation.id))) == 2
+
+        series = session.scalars(select(PriceSeries)).one()
+        # The confirmed baseline holds, so that a run of small drifts is
+        # measured against one fixed point and eventually clears the threshold.
+        assert series.last_price == Decimal("3000.00")
+        # ...but the DISPLAYED price is what the hotel is actually asking. This
+        # is the number on the dashboard, and it has to agree with the hotel's
+        # own booking page even when the move was too small to alert on.
+        assert series.current_price == Decimal("2980.00")
+
+    def test_display_price_tracks_every_check_while_the_baseline_holds(
+        self, session, hotel_fixture
+    ):
+        """A run of sub-threshold drops, none of which ever alerts.
+
+        The regression this pins down: the dashboard read `last_price`, so a
+        hotel that walked its rate down in small steps was shown a number it
+        had long stopped charging, and the gap only widened -- nothing short of
+        one threshold-clearing move ever closed it.
+        """
+        base = datetime.now(UTC)
+        for minutes, price in ((0, "3000"), (30, "2970"), (60, "2945"), (90, "2920")):
+            ingest_fetch_result(
+                session,
+                _result(_offer(price=price)),
+                _context(hotel_fixture, checked_at=base + timedelta(minutes=minutes)),
+            )
+            session.flush()
+
+        series = session.scalars(select(PriceSeries)).one()
+        # Each step was under both floors against the 3000 baseline, so nothing
+        # was ever confirmed and nobody was told.
+        assert session.scalar(select(func.count(PriceChange.id))) == 0
+        assert series.last_price == Decimal("3000.00")
+        # The screen shows the live rate regardless.
+        assert series.current_price == Decimal("2920.00")
+
+    def test_a_sold_out_check_keeps_the_last_known_display_price(
+        self, session, hotel_fixture
+    ):
+        """Availability is carried by `is_available`, not by blanking the rate.
+
+        Wiping it would lose the last known price for as long as the room
+        stayed unavailable, and the dashboard would have nothing to show beside
+        the "sold out" pill.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+        ingest_fetch_result(
+            session,
+            _result(_offer(price=None, available=False)),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        series = session.scalars(select(PriceSeries)).one()
+        assert series.is_available is False
+        assert series.current_price == Decimal("3000.00")
+
+
+class TestAvailability:
+    def test_sold_out_is_its_own_event_not_a_drop_to_zero(self, session, hotel_fixture):
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(price=None, available=False), sold_out=True),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.direction.value == "became_unavailable"
+        assert change.new_price is None
+        assert change.delta_pct is None          # never -100%
+        assert change.old_price == Decimal("3000.00")
+        assert summary.changes_detected == 1
+
+    def test_a_room_that_disappears_from_the_page_is_marked_unavailable(
+        self, session, hotel_fixture
+    ):
+        """Otherwise a sold-out room freezes at its last price forever.
+
+        Takes two checks now: absence is confirmed before it is announced.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session,
+            _result(_offer(), _offer(name="Deluxe Room", price="4000", meal_plan="Breakfast")),
+            _context(hotel_fixture, checked_at=base),
+        )
+        session.flush()
+        assert session.scalar(select(func.count(PriceSeries.offer_key))) == 2
+
+        # Only the room-only rate comes back, twice running.
+        for minutes in (30, 60):
+            ingest_fetch_result(
+                session,
+                _result(_offer()),
+                _context(hotel_fixture, checked_at=base + timedelta(minutes=minutes)),
+            )
+            session.flush()
+
+        unavailable = session.scalars(
+            select(PriceSeries).where(PriceSeries.is_available.is_(False))
+        ).all()
+        assert len(unavailable) == 1
+        assert unavailable[0].meal_plan == "Breakfast"
+
+    def test_one_check_missing_a_room_tells_nobody(self, session, hotel_fixture):
+        """The partial read. A page that returns SOME rooms looks successful.
+
+        On 1 Sep a check returned five of nine rooms; the four it omitted were
+        reported sold out, and reported available again fourteen minutes later
+        when the next check read the whole page. Eight alerts, no events.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session,
+            _result(_offer(), _offer(name="Deluxe Room", price="4000", meal_plan="Breakfast")),
+            _context(hotel_fixture, checked_at=base),
+        )
+        session.flush()
+
+        ingest_fetch_result(
+            session,
+            _result(_offer()),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        assert session.scalars(select(PriceChange)).all() == [], "alerted on one bad read"
+        assert session.scalar(
+            select(func.count(PriceSeries.offer_key)).where(
+                PriceSeries.is_available.is_(False)
+            )
+        ) == 0
+
+    def test_a_room_that_comes_straight_back_is_never_reported_at_all(
+        self, session, hotel_fixture
+    ):
+        """The flap, end to end: gone from one read, back on the next."""
+        base = datetime.now(UTC)
+        both = _result(
+            _offer(), _offer(name="Deluxe Room", price="4000", meal_plan="Breakfast")
+        )
+        ingest_fetch_result(session, both, _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        # Truncated page.
+        ingest_fetch_result(
+            session,
+            _result(_offer()),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=15)),
+        )
+        session.flush()
+
+        # Whole page again.
+        ingest_fetch_result(
+            session,
+            _result(_offer(), _offer(name="Deluxe Room", price="4000", meal_plan="Breakfast")),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        assert session.scalars(select(PriceChange)).all() == []
+        series = session.scalars(
+            select(PriceSeries).where(PriceSeries.meal_plan == "Breakfast")
+        ).one()
+        assert series.is_available is True
+        assert series.missing_since is None, "the marker outlived the room coming back"
+
+    def test_an_empty_broken_fetch_marks_nothing_unavailable(self, session, hotel_fixture):
+        """A redesign must never be reported as "every room sold out"."""
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        ingest_fetch_result(
+            session,
+            FetchResult(offers=[], sold_out_detected=False),
+            _context(hotel_fixture, checked_at=base + timedelta(minutes=30)),
+        )
+        session.flush()
+
+        series = session.scalars(select(PriceSeries)).one()
+        assert series.is_available is True
+
+
+class TestRoomMatching:
+    """A name nothing matches is a NEW room, and gets one automatically.
+
+    This used to queue an ``UnmatchedOffer`` and record no price at all until
+    somebody mapped the name by hand. Two things went wrong with that, and the
+    second is the expensive one: the room had no price for as long as the queue
+    went unread, and the question put to the operator was "which of these
+    existing rooms is it?" -- whose obliging answer merges two different rooms
+    into one series.
+
+    That is not hypothetical. On a real property "Premium Room (Mahogany)" was
+    hand-mapped onto "Deluxe Room (Maple)", after which a night when the site
+    happened to show the premium room was published as a price rise on the
+    deluxe one.
+
+    The two mistakes are not symmetrical. A split series is a visible duplicate
+    anyone can merge afterwards; a merged series is invisible and corrupts the
+    history permanently. Creating always splits and never merges.
+    """
+
+    def test_an_unknown_room_gets_its_own_room_type_and_a_price(
+        self, session, hotel_fixture
+    ):
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(name="Presidential Villa with Private Pool")),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        assert summary.offers_matched == 1
+        assert summary.offers_unmatched == 0
+
+        created = session.scalars(
+            select(RoomType).where(RoomType.name == "Presidential Villa with Private Pool")
+        ).one()
+        assert created.hotel_id == hotel_fixture["hotel"].id
+        # After the room it already knew, so a dashboard someone has learned
+        # does not reshuffle when a new room turns up.
+        assert created.sort_order > hotel_fixture["room"].sort_order
+
+        # The price is recorded, which is the whole point: it used to be lost.
+        series = session.scalars(
+            select(PriceSeries).where(PriceSeries.room_type_id == created.id)
+        ).one()
+        assert series.current_price == Decimal("3000.00")
+
+        # Nothing is asked of a human.
+        assert session.scalar(select(func.count(UnmatchedOffer.id))) == 0
+
+    def test_repeat_sightings_reuse_the_room_rather_than_duplicating_it(
+        self, session, hotel_fixture
+    ):
+        """The second sighting must match by canonical name, not create again."""
+        # Explicit, spaced timestamps: observations are unique on
+        # (offer_key, checked_at) with ON CONFLICT DO NOTHING, so three
+        # ingests sharing a wall clock reading collapse into fewer rows and
+        # the count below fails for a reason that has nothing to do with
+        # room matching.
+        base = datetime.now(UTC)
+        for minutes in (0, 30, 60):
+            ingest_fetch_result(
+                session,
+                _result(_offer(name="Mystery Suite")),
+                _context(hotel_fixture, checked_at=base + timedelta(minutes=minutes)),
+            )
+            session.flush()
+
+        rooms = session.scalars(
+            select(RoomType).where(RoomType.name == "Mystery Suite")
+        ).all()
+        assert len(rooms) == 1
+        # One series, three observations -- a genuine history, not three
+        # orphaned rooms each seen once.
+        series = session.scalars(
+            select(PriceSeries).where(PriceSeries.room_type_id == rooms[0].id)
+        ).one()
+        assert session.scalar(
+            select(func.count(PriceObservation.id)).where(
+                PriceObservation.offer_key == series.offer_key
+            )
+        ) == 3
+
+    def test_two_new_rooms_in_one_fetch_each_get_their_own(self, session, hotel_fixture):
+        """The room created for the first offer must be visible to the second."""
+        ingest_fetch_result(
+            session,
+            _result(_offer(name="Garden Villa"), _offer(name="Treehouse", price="4100")),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        names = set(session.scalars(select(RoomType.name)).all())
+        assert {"Garden Villa", "Treehouse"} <= names
+        assert session.scalar(select(func.count(PriceSeries.offer_key))) == 2
+
+    def test_a_rename_splits_rather_than_merging_onto_the_near_miss(
+        self, session, hotel_fixture
+    ):
+        """"Deluxe Room" becomes "Deluxe Double Room": ambiguous, so split.
+
+        The shape of this change -- one qualifier added -- is identical to what
+        separates "Deluxe Double Occupancy" from "Super Deluxe Double
+        Occupancy": two different rooms at very different rates. The rename
+        scores 63.2 against the stored canonical name and that sibling scores
+        88.5, so any threshold that merged the first would also merge the
+        second.
+
+        Since the two cases cannot be told apart, the pipeline takes the
+        recoverable one. If it really was a rename the result is a duplicate
+        room on the hotel page, which is visible and mergeable; the alternative
+        silently welds two rooms together forever.
+        """
+        summary = ingest_fetch_result(
+            session, _result(_offer(name="Deluxe Double Room")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        assert summary.offers_matched == 1
+        created = session.scalars(
+            select(RoomType).where(RoomType.name == "Deluxe Double Room")
+        ).one()
+        assert created.id != hotel_fixture["room"].id
+
+        # The existing room is untouched -- nothing was folded into it.
+        assert session.scalar(
+            select(func.count(PriceSeries.offer_key)).where(
+                PriceSeries.room_type_id == hotel_fixture["room"].id
+            )
+        ) == 0
+
+    def test_a_name_that_normalises_to_nothing_is_still_queued(
+        self, session, hotel_fixture
+    ):
+        """The one case a person is still needed for.
+
+        With no canonical form there is nothing to match the room by next time,
+        so creating one would produce a room type that could never be found
+        again -- a fresh one on every single check.
+        """
+        summary = ingest_fetch_result(
+            session, _result(_offer(name="---")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        assert summary.offers_unmatched == 1
+        assert session.scalar(select(func.count(PriceSeries.offer_key))) == 0
+        assert session.scalars(select(UnmatchedOffer)).one().raw_room_name == "---"
+
+
+class TestAFieldLabelIsNotANewRoom:
+    """A label read out of a spec table must not become a room.
+
+    THE REAL CASE. Booking.com prints each room card's bed configuration as a
+    definition list. On 3 Sep the room-name selector for Competitor B reached into
+    it, and the hotel acquired three rooms called "Bed:", "Bedroom:" and
+    "Beds:", each with its own price series, each sitting in the comparison
+    grid ever since.
+
+    Every safety net in the pipeline let them through, and they were right to.
+    "Beds:" normalises to "beds", which is a perfectly good canonical form: it
+    collides with nothing, so nothing collapses; it resembles no existing room,
+    so nothing is merged. From there on it is indistinguishable from a room the
+    hotel has genuinely just added, which is a thing this pipeline is supposed
+    to handle by creating it.
+    """
+
+    def test_no_room_type_is_created_for_it(self, session, hotel_fixture):
+        summary = ingest_fetch_result(
+            session, _result(_offer(name="Beds:")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        assert summary.offers_not_a_room == 1
+        assert summary.not_a_room_names == ["Beds:"]
+        assert session.scalars(
+            select(RoomType).where(RoomType.name == "Beds:")
+        ).all() == []
+
+    def test_it_files_no_price_and_no_unmatched_row(self, session, hotel_fixture):
+        """Not queued for a person either. Unmatched is a list of names
+        somebody must map to a room, and there is no room to map a label to --
+        it would be a permanent Attention row that nobody can ever clear."""
+        ingest_fetch_result(
+            session, _result(_offer(name="Beds:")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        assert session.scalar(select(func.count(PriceSeries.offer_key))) == 0
+        assert session.scalars(select(UnmatchedOffer)).all() == []
+
+    def test_the_real_rooms_in_the_same_fetch_are_untouched(self, session, hotel_fixture):
+        """The label arrives BESIDE the rooms, card by card. Dropping it must
+        cost the fetch nothing else -- this is the shape the Competitor B fetch
+        actually had."""
+        summary = ingest_fetch_result(
+            session,
+            _result(
+                _offer(name="Deluxe Double Room", price="3000"),
+                _offer(name="Beds:", price="3000"),
+                _offer(name="Superior Double Room", price="4200"),
+            ),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        assert summary.offers_matched == 2
+        assert summary.offers_not_a_room == 1
+        assert sorted(
+            r.name for r in session.scalars(select(RoomType)).all()
+        ) == ["Deluxe Double Room", "Deluxe Room", "Superior Double Room"]
+
+    def test_a_name_that_merely_contains_a_colon_is_a_room(self, session, hotel_fixture):
+        """The rule is a name that ENDS in a colon. A room described in two
+        halves is still a room, and throwing it away would be the same defect
+        pointed the other way."""
+        summary = ingest_fetch_result(
+            session,
+            _result(_offer(name="Deluxe Room: Garden View")),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        assert summary.offers_not_a_room == 0
+        assert summary.offers_matched == 1
+
+
+class TestIdempotency:
+    def test_replaying_a_task_writes_no_duplicate_observation(self, session, hotel_fixture):
+        """Celery redelivers on worker loss; the pipeline must absorb that."""
+        checked_at = datetime.now(UTC)
+        context = _context(hotel_fixture, checked_at=checked_at)
+
+        ingest_fetch_result(session, _result(_offer()), context)
+        session.flush()
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture,
+                                                                checked_at=checked_at))
+        session.flush()
+
+        assert session.scalar(select(func.count(PriceObservation.id))) == 1
+
+
+class TestMealPlanIdentity:
+    def test_different_meal_plans_are_different_series(self, session, hotel_fixture):
+        """The core guarantee: mismatched conditions cannot be compared.
+
+        A room-only rate and a breakfast-inclusive rate for the same room are
+        different offers. They land in different rows, so a change can never be
+        manufactured by comparing one against the other.
+        """
+        ingest_fetch_result(
+            session,
+            _result(
+                _offer(price="3000", meal_plan="Room Only"),
+                _offer(price="3400", meal_plan="Breakfast Included"),
+            ),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        series = session.scalars(select(PriceSeries)).all()
+        assert len(series) == 2
+        assert {s.last_price for s in series} == {Decimal("3000.00"), Decimal("3400.00")}
+        assert session.scalar(select(func.count(PriceChange.id))) == 0
+
+
+class TestBasisChange:
+    """Switching the comparison basis must not invent a price movement.
+
+    A room quoted "₹999 + ₹49.95 taxes" is ₹999 exclusive and ₹1,048.95
+    inclusive — one price, two components. Comparing the new component against
+    the stored one would read as a 4.8% drop on every room in the portfolio at
+    once, which is both wrong and the exact shape of an alert people learn to
+    ignore.
+    """
+
+    def _both_components(self, name="Deluxe Room"):
+        return NormalizedOffer(
+            raw_room_name=name,
+            price_inclusive=Decimal("1048.95"),
+            price_exclusive=Decimal("999.00"),
+            taxes_fees=Decimal("49.95"),
+            currency="INR",
+        )
+
+    def test_rebases_silently_and_records_no_change(self, session, hotel_fixture):
+        offer = self._both_components()
+        ingest_fetch_result(session, _result(offer), _context(hotel_fixture))
+        session.flush()
+
+        series = session.execute(select(PriceSeries)).scalar_one()
+        assert series.last_price == Decimal("1048.95")
+        assert series.last_price_basis is PriceBasis.INCLUSIVE
+
+        summary = ingest_fetch_result(
+            session,
+            _result(offer),
+            _context(hotel_fixture, price_basis=PriceBasis.EXCLUSIVE),
+        )
+        session.flush()
+
+        # The stored price is now the one the booking page prints...
+        series = session.execute(select(PriceSeries)).scalar_one()
+        assert series.last_price == Decimal("999.00")
+        assert series.last_price_basis is PriceBasis.EXCLUSIVE
+        # ...and nobody was told the price fell.
+        assert summary.changes_detected == 0
+        assert session.execute(select(func.count(PriceChange.id))).scalar_one() == 0
+
+    def test_next_check_compares_normally_again(self, session, hotel_fixture):
+        """The rebase is one check, not a permanent amnesia."""
+        offer = self._both_components()
+        ingest_fetch_result(session, _result(offer), _context(hotel_fixture))
+        session.flush()
+        ingest_fetch_result(
+            session, _result(offer), _context(hotel_fixture, price_basis=PriceBasis.EXCLUSIVE)
+        )
+        session.flush()
+
+        later = datetime.now(UTC) + timedelta(hours=1)
+        dearer = NormalizedOffer(
+            raw_room_name="Deluxe Room",
+            price_inclusive=Decimal("1574.95"),
+            price_exclusive=Decimal("1499.00"),
+            taxes_fees=Decimal("75.95"),
+            currency="INR",
+        )
+        for offset, ctx_time in enumerate((later, later + timedelta(hours=1))):
+            summary = ingest_fetch_result(
+                session,
+                _result(dearer),
+                _context(
+                    hotel_fixture, checked_at=ctx_time, price_basis=PriceBasis.EXCLUSIVE
+                ),
+            )
+            session.flush()
+
+        # Confirmed on the second sighting, and measured on the new basis:
+        # 999 -> 1499, not 1048.95 -> 1499.
+        assert summary.changes_detected == 1
+        change = session.execute(select(PriceChange)).scalar_one()
+        assert change.old_price == Decimal("999.00")
+        assert change.new_price == Decimal("1499.00")
+
+    def test_carry_over_does_not_fire_across_a_basis_change(
+        self, session, hotel_fixture
+    ):
+        """The other door into the same false alarm.
+
+        A stay date already priced on the old basis is a different series, and
+        a past one never rebases itself because nobody checks yesterday again.
+        The carry-over comparison has no debounce, so an unguarded mismatch
+        publishes the tax component as a price drop immediately.
+        """
+        yesterday = StayWindow(
+            STAY.check_in - timedelta(days=1), STAY.check_out - timedelta(days=1)
+        )
+        old_ctx = _context(hotel_fixture)
+        ingest_fetch_result(
+            session,
+            _result(self._both_components()),
+            replace(old_ctx, stay=yesterday),
+        )
+        session.flush()
+
+        summary = ingest_fetch_result(
+            session,
+            _result(self._both_components()),
+            _context(hotel_fixture, price_basis=PriceBasis.EXCLUSIVE),
+        )
+        session.flush()
+
+        assert summary.change_ids == []
+        assert session.execute(select(func.count(PriceChange.id))).scalar_one() == 0
+
+
+class TestANightToNightMoveIsAMove:
+    """``last_changed_at`` must move when the carry-over comparison reports.
+
+    Under a rolling target every night is a new series that lives one day,
+    so a hotel that reprices by day of the week and never within a day only
+    ever changes price ACROSS series. That path wrote the PriceChange and
+    left the series timestamp alone, so the health check read HCG Murmuring
+    Meadows as "no price has moved in 12 days" while the Changes page listed
+    ten of its weekend moves in the same fortnight.
+    """
+
+    # Tonight and last night, each checked on its own day -- lead distance
+    # zero, like the rolling targets this deployment runs. The comparison is
+    # like-for-like on lead distance, so both nights must be watched the same
+    # way or it (rightly) stays silent. Anchored to the real today rather than
+    # STAY because observations are partitioned by month and the test
+    # database only carries last month, this one and next.
+    TONIGHT_AT = datetime.now(UTC).replace(hour=6, minute=0, second=0, microsecond=0)
+    TONIGHT = StayWindow(TONIGHT_AT.date(), TONIGHT_AT.date() + timedelta(days=1))
+    LAST_NIGHT_AT = TONIGHT_AT - timedelta(days=1)
+    LAST_NIGHT = StayWindow(LAST_NIGHT_AT.date(), TONIGHT.check_in)
+
+    def test_a_carry_over_change_stamps_the_new_series(self, session, hotel_fixture):
+        ingest_fetch_result(
+            session, _result(_offer(price="3000")),
+            replace(_context(hotel_fixture, checked_at=self.LAST_NIGHT_AT), stay=self.LAST_NIGHT),
+        )
+        session.flush()
+
+        summary = ingest_fetch_result(
+            session, _result(_offer(price="3520")),
+            replace(_context(hotel_fixture, checked_at=self.TONIGHT_AT), stay=self.TONIGHT),
+        )
+        session.flush()
+
+        assert len(summary.change_ids) == 1, "the weekend rate is a move"
+        tonight = session.scalars(
+            select(PriceSeries).where(PriceSeries.check_in == self.TONIGHT.check_in)
+        ).one()
+        assert tonight.last_changed_at == self.TONIGHT_AT
+
+    def test_a_silent_first_sighting_leaves_it_unset(self, session, hotel_fixture):
+        """Same price as last night is not a move, and must not look like one."""
+        ingest_fetch_result(
+            session, _result(_offer(price="3000")),
+            replace(_context(hotel_fixture, checked_at=self.LAST_NIGHT_AT), stay=self.LAST_NIGHT),
+        )
+        session.flush()
+        ingest_fetch_result(
+            session, _result(_offer(price="3000")),
+            replace(_context(hotel_fixture, checked_at=self.TONIGHT_AT), stay=self.TONIGHT),
+        )
+        session.flush()
+
+        tonight = session.scalars(
+            select(PriceSeries).where(PriceSeries.check_in == self.TONIGHT.check_in)
+        ).one()
+        assert tonight.last_changed_at is None
+
+
+class TestWhenThePriceActuallyChanged:
+    """`changed_at` is when the debounce finished, which is a different fact.
+
+    A change is written on its second consecutive sighting, so on a 30-minute
+    target the recorded time can be an hour after the hotel moved its rate.
+    Showing only that answers "when did we finish checking". `first_seen_at`
+    carries the moment the new price appeared.
+    """
+
+    def test_first_seen_precedes_the_confirmation(self, session, hotel_fixture):
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session, _result(_offer(price="3000")), _context(hotel_fixture, checked_at=base)
+        )
+        session.flush()
+
+        seen_at = base + timedelta(minutes=30)
+        ingest_fetch_result(
+            session, _result(_offer(price="3500")), _context(hotel_fixture, checked_at=seen_at)
+        )
+        session.flush()
+        assert session.scalar(select(func.count(PriceChange.id))) == 0, "not yet confirmed"
+
+        confirmed_at = base + timedelta(minutes=60)
+        ingest_fetch_result(
+            session,
+            _result(_offer(price="3500")),
+            _context(hotel_fixture, checked_at=confirmed_at),
+        )
+        session.flush()
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.changed_at == confirmed_at
+        assert change.first_seen_at == seen_at
+        # The gap is the whole point: half an hour of it here.
+        assert change.changed_at - change.first_seen_at == timedelta(minutes=30)
+
+    def test_it_holds_when_confirmation_takes_three_checks(self, session, hotel_fixture):
+        """The first sighting must not slide forward with each check.
+
+        Stamping the pending time on every check reads correctly at
+        confirm_checks=2, where there is only one pending check to get wrong.
+        At three it moves one check at a time, and the recorded first sighting
+        is wrong by exactly the amount that still looks plausible.
+        """
+        base = datetime.now(UTC)
+        ctx = lambda t: _context(hotel_fixture, checked_at=t, confirm_checks=3)  # noqa: E731
+
+        ingest_fetch_result(session, _result(_offer(price="3000")), ctx(base))
+        session.flush()
+
+        seen_at = base + timedelta(minutes=10)
+        for offset in (10, 20, 30):
+            ingest_fetch_result(
+                session, _result(_offer(price="3500")), ctx(base + timedelta(minutes=offset))
+            )
+            session.flush()
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.first_seen_at == seen_at, "the first sighting slid forward"
+        assert change.changed_at == base + timedelta(minutes=30)
+
+    def test_a_room_disappearing_has_no_earlier_sighting(self, session, hotel_fixture):
+        """A DECLARED sold-out is reported on the check that finds it.
+
+        The page has to SAY it is sold out. An empty result with no such marker
+        is a broken read, and the sweep deliberately ignores it rather than
+        reporting a redesign as every room selling out at once. A room merely
+        absent from a page that still lists others is debounced instead; this
+        one is a statement by the page and is believed at once.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        gone_at = base + timedelta(minutes=30)
+        ingest_fetch_result(
+            session, _result(sold_out=True), _context(hotel_fixture, checked_at=gone_at)
+        )
+        session.flush()
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.direction is ChangeDirection.BECAME_UNAVAILABLE
+        assert change.first_seen_at == change.changed_at == gone_at
+
+
+class TestOffersThatCollapseIntoOneRoom:
+    """Several rooms arriving under one name is a broken selector, not a fetch.
+
+    A six-room property was monitored as a single room for weeks because its
+    room_name selector had landed on an amenity chip reading "King Size Bed" on
+    every card. Every offer then computed the same offer key, five were dropped
+    to protect the transaction, and the check run recorded six offers found,
+    zero unmatched, and success.
+
+    Dropping them is still correct -- the offer key is the primary key of
+    price_series, so writing both would abort the fetch and lose the rooms that
+    were fine. What was missing is that anyone ever heard about it.
+    """
+
+    def test_the_drop_is_counted_and_the_names_kept(self, session, hotel_fixture):
+        summary = ingest_fetch_result(
+            session,
+            _result(
+                _offer(name="Deluxe Room", price="3000"),
+                _offer(name="Deluxe Room", price="4200"),
+                _offer(name="Deluxe Room", price="5100"),
+            ),
+            _context(hotel_fixture),
+        )
+        session.flush()
+
+        assert summary.offers_seen == 3
+        # All three RESOLVED to a room type -- offers_matched counts the match,
+        # not the write -- which is precisely why it cannot be used to notice
+        # this. It reads three on a fetch that stored one.
+        assert summary.offers_matched == 3
+        # Not unmatched either: they matched a room perfectly well. They
+        # matched the SAME one, which is a different failure needing a
+        # different message.
+        assert summary.offers_unmatched == 0
+        assert summary.offers_collapsed == 2
+        assert summary.collapsed_names == ["Deluxe Room"]
+
+        # Exactly one series, as before. The guard still protects the write.
+        assert session.scalar(select(func.count(PriceSeries.offer_key))) == 1
+
+    def test_a_clean_fetch_reports_no_collapse(self, session, hotel_fixture):
+        """The counter must stay at zero on the ordinary path, or the error it
+        feeds becomes noise on Attention and stops being read."""
+        summary = ingest_fetch_result(
+            session, _result(_offer()), _context(hotel_fixture)
+        )
+        session.flush()
+
+        assert summary.offers_collapsed == 0
+        assert summary.collapsed_names == []
+
+
+class TestTheNeedsMappingQueueClearsItself:
+    """A queued name that starts matching must retire its own entry.
+
+    Almost everything is auto-created now, so the queue only ever holds names
+    with no canonical form. Those can still be resolved -- by an operator
+    renaming the offer's room, or by the site itself starting to publish a
+    usable name -- and the row has to close when that happens.
+
+    Nothing used to close them, so the queue only ever grew. That is how six
+    rooms came to sit on the Attention page under "no candidate" while those
+    exact six rooms were already being monitored correctly on the hotel page.
+    """
+
+    def test_a_row_queued_before_auto_creation_closes_on_the_next_sighting(
+        self, session, hotel_fixture
+    ):
+        """The migration path off the old behaviour.
+
+        Every name queued while the pipeline still asked a human is still
+        sitting in this table. The next time the site shows that room the
+        pipeline creates it and records its price, so the row asking for a
+        mapping is work that no longer needs doing and must close itself --
+        otherwise the Attention page stays full of rooms that are already
+        being monitored correctly, and stops being read.
+        """
+        queued = UnmatchedOffer(
+            hotel_source_id=hotel_fixture["hotel_source"].id,
+            raw_room_name="Garden Villa",
+            normalized_name="garden villa",
+            first_seen_at=datetime.now(UTC),
+            last_seen_at=datetime.now(UTC),
+            occurrence_count=4,
+        )
+        session.add(queued)
+        session.flush()
+        assert queued.resolved_at is None
+
+        ingest_fetch_result(
+            session, _result(_offer(name="Garden Villa")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        session.refresh(queued)
+        assert queued.resolved_at is not None
+        # And it closed because the room now genuinely exists.
+        assert session.scalars(
+            select(RoomType).where(RoomType.name == "Garden Villa")
+        ).one() is not None
+
+    def test_a_name_that_still_does_not_match_stays_queued(self, session, hotel_fixture):
+        """Only the row for the name that actually resolved is closed."""
+        ingest_fetch_result(
+            session, _result(_offer(name="---")), _context(hotel_fixture)
+        )
+        session.flush()
+
+        # A different offer resolving must not clear someone else's row.
+        ingest_fetch_result(session, _result(_offer()), _context(hotel_fixture))
+        session.flush()
+
+        still_open = session.scalars(
+            select(UnmatchedOffer).where(UnmatchedOffer.resolved_at.is_(None))
+        ).all()
+        assert [row.raw_room_name for row in still_open] == ["---"]
+
+
+class TestTheTaxComponentsOfAMove:
+    """A confirmed change records what each of its two prices was made of.
+
+    WHY THE ROW CARRIES THEM AT ALL
+    ===============================
+    ``old_price`` and ``new_price`` are one number each, on ``PRICE_BASIS``.
+    An alert rendered from them cannot honour the "show prices with tax"
+    switch on Settings -- there is nothing to add. The components are on
+    ``price_series`` too, but that row is overwritten on every check, and a
+    digest held through quiet hours is rebuilt hours and many checks later.
+    So they are frozen onto the change, once, and never touched again.
+    """
+
+    @staticmethod
+    def _split(price, tax, name="Deluxe Room"):
+        """A site that quotes the room and states the tax beside it."""
+        return NormalizedOffer(
+            raw_room_name=name,
+            price_exclusive=Decimal(price),
+            taxes_fees=Decimal(tax),
+            currency="INR",
+            is_available=True,
+        )
+
+    def _confirm(self, session, fixture, base, offer, minutes):
+        """Feed the same offer twice, which is what the debounce asks for."""
+        for step in (minutes, minutes + 30):
+            ingest_fetch_result(
+                session,
+                _result(offer),
+                _context(
+                    fixture,
+                    checked_at=base + timedelta(minutes=step),
+                    price_basis=PriceBasis.EXCLUSIVE,
+                ),
+            )
+            session.flush()
+
+    def test_both_sides_are_recorded(self, session, hotel_fixture):
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session,
+            _result(self._split("9000", "1620")),
+            _context(hotel_fixture, checked_at=base, price_basis=PriceBasis.EXCLUSIVE),
+        )
+        session.flush()
+
+        self._confirm(session, hotel_fixture, base, self._split("9500", "1710"), 30)
+
+        change = session.scalars(select(PriceChange)).one()
+        assert (change.old_price, change.new_price) == (
+            Decimal("9000.00"),
+            Decimal("9500.00"),
+        )
+        assert (change.old_price_exclusive, change.old_taxes_fees) == (
+            Decimal("9000.00"),
+            Decimal("1620.00"),
+        )
+        assert (change.new_price_exclusive, change.new_taxes_fees) == (
+            Decimal("9500.00"),
+            Decimal("1710.00"),
+        )
+
+    def test_a_wobble_too_small_to_alert_does_not_move_the_was_side(self, session, hotel_fixture):
+        """The reason ``baseline_price_*`` exist beside ``last_price_*``.
+
+        ``last_price`` deliberately holds still through a sub-threshold drift,
+        so that a run of them accumulates against one fixed point instead of
+        each step being waved through. Its components have to hold still with
+        it. Reading ``last_price_exclusive`` for the "was" side would have
+        printed a baseline of 9,000 beside the tax from a 9,020 reading -- a
+        pair of numbers that never appeared together on any page.
+        """
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session,
+            _result(self._split("9000", "1620")),
+            _context(hotel_fixture, checked_at=base, price_basis=PriceBasis.EXCLUSIVE),
+        )
+        session.flush()
+
+        # 20 rupees: under the 50-rupee floor, so nothing is confirmed and the
+        # baseline stays exactly where it was.
+        ingest_fetch_result(
+            session,
+            _result(self._split("9020", "1623.60")),
+            _context(
+                hotel_fixture,
+                checked_at=base + timedelta(minutes=30),
+                price_basis=PriceBasis.EXCLUSIVE,
+            ),
+        )
+        session.flush()
+
+        series = session.scalars(select(PriceSeries)).one()
+        assert series.last_price == Decimal("9000.00")
+        # The screen follows every check...
+        assert series.last_taxes_fees == Decimal("1623.60")
+        # ...and the baseline does not.
+        assert series.baseline_price_exclusive == Decimal("9000.00")
+        assert series.baseline_taxes_fees == Decimal("1620.00")
+
+        self._confirm(session, hotel_fixture, base, self._split("9500", "1710"), 60)
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.old_price == Decimal("9000.00")
+        assert change.old_taxes_fees == Decimal("1620.00")
+
+    def test_a_sold_out_room_keeps_the_components_of_the_price_it_had(
+        self, session, hotel_fixture
+    ):
+        base = datetime.now(UTC)
+        ingest_fetch_result(
+            session,
+            _result(self._split("9000", "1620")),
+            _context(hotel_fixture, checked_at=base, price_basis=PriceBasis.EXCLUSIVE),
+        )
+        session.flush()
+
+        # Declared sold out by the page, which needs no debounce.
+        ingest_fetch_result(
+            session,
+            _result(sold_out=True),
+            _context(
+                hotel_fixture,
+                checked_at=base + timedelta(minutes=30),
+                price_basis=PriceBasis.EXCLUSIVE,
+            ),
+        )
+        session.flush()
+
+        change = session.scalars(select(PriceChange)).one()
+        assert change.direction is ChangeDirection.BECAME_UNAVAILABLE
+        assert change.old_price_exclusive == Decimal("9000.00")
+        assert change.old_taxes_fees == Decimal("1620.00")
+        # There is no new price, so there are no new components to invent.
+        assert change.new_price_exclusive is None
+        assert change.new_taxes_fees is None
+
+
+class TestASiteRoomIdOutlivesItsName:
+    """Agoda reused one room's name for another, and the id is what told them apart.
+
+    On 23 Oct 2026 Agoda listed Our Resort's CLASSIC room as "Deluxe Family Room"
+    (id 275801276) beside a dearer "Deluxe Room" (262752532). On the 24th the
+    CLASSIC room was printed as "Deluxe Room". Matched by name, its rate was
+    filed under the other room and CLASSIC fell out of Repricing.
+    """
+
+    def _rooms(self, session, fixture):
+        from app.db.models import MatchMethod, RoomTypeAlias
+
+        classic = RoomType(hotel_id=fixture["hotel"].id, name="Deluxe Double Room",
+                           canonical_name="deluxe double")
+        session.add(classic)
+        session.flush()
+        session.add(RoomTypeAlias(
+            room_type_id=classic.id, hotel_id=fixture["hotel"].id,
+            source_id=fixture["source"].id, raw_name="Deluxe Family Room",
+            normalized_name="deluxe family", match_method=MatchMethod.MANUAL, confidence=1))
+        session.flush()
+        return classic, fixture["room"]          # the fixture's room is "Deluxe Room"
+
+    def _series_room(self, session, price):
+        return {s.room_type_id for s in session.scalars(select(PriceSeries)).all()
+                if s.current_price == Decimal(price)}
+
+    def test_a_room_renamed_to_another_rooms_name_stays_itself(self, session, hotel_fixture):
+        classic, deluxe = self._rooms(session, hotel_fixture)
+        base = datetime.now(UTC)
+        ingest_fetch_result(session, _result(
+            _offer(name="Deluxe Family Room", price="4725", site_room_id="275801276"),
+            _offer(name="Deluxe Room", price="7200", site_room_id="262752532"),
+        ), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        # The next night of fetching: the CLASSIC room under the other's name.
+        ingest_fetch_result(session, _result(
+            _offer(name="Deluxe Room", price="6300", site_room_id="275801276"),
+        ), _context(hotel_fixture, checked_at=base + timedelta(minutes=30)))
+        session.flush()
+
+        series = {s.room_type_id: s for s in session.scalars(select(PriceSeries)).all()}
+        assert series[classic.id].current_price == Decimal("6300.00")
+        assert series[deluxe.id].current_price == Decimal("7200.00")
+
+    def test_a_hand_made_mapping_re_points_the_id(self, session, hotel_fixture):
+        """A person who maps a name has looked at the room; the id follows them."""
+        from app.db.models import MatchMethod, RoomTypeAlias
+
+        classic, deluxe = self._rooms(session, hotel_fixture)
+        base = datetime.now(UTC)
+        # Learned wrong, by name, before anyone looked.
+        ingest_fetch_result(session, _result(
+            _offer(name="Deluxe Room", price="6300", site_room_id="275801276"),
+        ), _context(hotel_fixture, checked_at=base))
+        session.flush()
+
+        session.add(RoomTypeAlias(
+            room_type_id=classic.id, hotel_id=hotel_fixture["hotel"].id,
+            source_id=hotel_fixture["source"].id, raw_name="Classic Deluxe",
+            normalized_name="classic deluxe", match_method=MatchMethod.MANUAL, confidence=1))
+        session.flush()
+        ingest_fetch_result(session, _result(
+            _offer(name="Classic Deluxe", price="6400", site_room_id="275801276"),
+        ), _context(hotel_fixture, checked_at=base + timedelta(minutes=30)))
+        ingest_fetch_result(session, _result(
+            _offer(name="Deluxe Room", price="6500", site_room_id="275801276"),
+        ), _context(hotel_fixture, checked_at=base + timedelta(minutes=60)))
+        session.flush()
+
+        assert self._series_room(session, "6500") == {classic.id}
+
+    def test_an_offer_without_an_id_matches_by_name_as_before(self, session, hotel_fixture):
+        classic, _ = self._rooms(session, hotel_fixture)
+        ingest_fetch_result(session, _result(_offer(name="Deluxe Family Room", price="5600")),
+                            _context(hotel_fixture))
+        session.flush()
+        assert self._series_room(session, "5600") == {classic.id}

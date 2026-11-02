@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Changes · Hotel Price Monitor{% endblock %}
+
+{% block content %}
+<h1>Changes</h1>
+<p class="muted">
+  Every row here cleared both the significance threshold and the confirmation
+  checks. Movements below the threshold, and one-off blips that did not
+  persist, are recorded in the price history but never appear here.
+</p>
+
+<form class="filters" method="get" action="/changes">
+  <label>Hotel
+    <select name="hotel_id">
+      <option value="">All hotels</option>
+      {% for hotel in hotels %}
+      <option value="{{ hotel.id }}" {{ 'selected' if hotel_id == hotel.id else '' }}>{{ hotel.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {# Two ways of saying "when", because they answer different questions: the
+     window for "what moved lately", explicit dates for "what happened on the
+     day that guest complained". Dates win when both are set. #}
+  <label>Window
+    <select name="hours">
+      {% for option in [24, 48, 168, 720] %}
+      <option value="{{ option }}" {{ 'selected' if hours == option else '' }}>
+        {{ 'last %dh'|format(option) if option < 168 else 'last %dd'|format(option // 24) }}
+      </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>From
+    <input type="date" name="date_from" value="{{ date_from }}">
+  </label>
+  <label>To
+    <input type="date" name="date_to" value="{{ date_to }}">
+  </label>
+  <button type="submit">Filter</button>
+  <a class="btn btn-export"
+     href="/changes/export?hours={{ hours }}{% if hotel_id %}&hotel_id={{ hotel_id }}{% endif %}{% if date_from %}&date_from={{ date_from }}{% endif %}{% if date_to %}&date_to={{ date_to }}{% endif %}">
+    ↓ Download Excel
+  </a>
+  {% if date_from or date_to %}
+  <a class="btn-link" href="/changes{{ '?hotel_id=%d'|format(hotel_id) if hotel_id else '' }}">Clear dates</a>
+  <span class="muted">Showing exact dates, so the window above is ignored.</span>
+  {% endif %}
+</form>
+
+{# Twelve rows, then a scrollbar. The filters above stay on screen, which
+   is what somebody narrowing a three-hundred-row window is reaching for. #}
+<div class="scroll-rows" data-rows="12">
+<table class="grid">
+  <thead>
+    <tr><th>When</th><th>Hotel</th><th>Room</th><th>Stay</th><th>Compared</th><th class="num">Was</th><th class="num">Now</th><th class="num">Change</th><th>Alert</th></tr>
+  </thead>
+  <tbody>
+    {% for change, hotel_name, room_name, check_in, check_out, meal_plan, room_type_id in changes %}
+    <tr>
+      {# WHEN THE PRICE MOVED, not when the debounce finished.
+
+         A change is only written on its second consecutive sighting, so
+         `changed_at` can be an hour later than the move on a 30-minute
+         target. Leading with that number answered "when did we finish
+         checking", which is not the question anyone asks here. The
+         confirmation time still appears underneath, because it is what the
+         alert timestamps refer to.
+
+         Older rows have no first sighting recorded and say so, rather than
+         showing a derived guess as though it were observed. #}
+      <td class="nowrap">
+        {% if change.first_seen_at %}
+          <span>{{ change.first_seen_at|localtime('%d %b %H:%M') }}</span>
+          {% if change.first_seen_at != change.changed_at %}
+          <span class="muted when-sub"
+                title="Seen at {{ change.first_seen_at|localtime('%H:%M') }}, and only recorded once the next check found the same price">
+            confirmed {{ change.changed_at|localtime('%H:%M') }}
+          </span>
+          {% endif %}
+        {% else %}
+          <span class="muted">{{ change.changed_at|localtime('%d %b %H:%M') }}</span>
+          <span class="muted when-sub" title="Recorded before the first sighting was tracked">confirmed</span>
+        {% endif %}
+      </td>
+      <td><a href="/hotels/{{ change.hotel_id }}">{{ hotel_name }}</a></td>
+      {# The board, under the name. One room sells on three of them at the
+         same time and this column showed none, so the same room arriving on
+         breakfast and on room-only was two identical-looking rows -- read,
+         reasonably, as the detector repeating itself. Only one board per room
+         reaches this table now (services/room_moves.py), and saying which one
+         is what stops the surviving row from looking arbitrary. #}
+      <td>{{ room_name or '—' }}{% if meal_plan %}<br><span class="muted">{{ meal_plan }}</span>{% endif %}</td>
+      <td class="nowrap muted">{{ check_in }} → {{ check_out }}</td>
+      {# Which two prices this row compared. "Was 1,023.75" means one thing
+         when both prices are the same night and quite another when they are
+         consecutive nights, so the basis is shown rather than implied. #}
+      <td class="nowrap muted">
+        {% if change.previous_offer_key %}
+          <span class="pill" title="Tonight's opening price against last night's closing price for the same room">vs last night</span>
+        {% else %}
+          <span class="muted" title="Two readings of the same stay date, taken hours apart">same night</span>
+        {% endif %}
+      </td>
+      <td class="num muted">{{ money(change.old_price, change.currency) }}</td>
+      <td class="num strong">
+        {% if change.direction.value == 'became_unavailable' %}
+          <span class="pill pill-soldout">sold out</span>
+        {% else %}
+          {{ money(change.new_price, change.currency) }}
+        {% endif %}
+      </td>
+      <td class="num {{ 'up' if change.direction.value == 'increase' else ('down' if change.direction.value == 'decrease' else '') }}">
+        {% if change.direction.value == 'became_available' %}
+          <span class="pill pill-ok">back</span>
+        {% elif change.delta %}
+          {{ '+' if change.direction.value == 'increase' else '−' }}{{ money(change.delta|abs, change.currency) }}
+          {% if change.delta_pct %}<span class="muted">({{ '%.1f'|format(change.delta_pct|abs) }}%)</span>{% endif %}
+        {% else %}—{% endif %}
+      </td>
+      <td>
+        {# NOT change.notified. That flag is set even when no recipient is
+           assigned to the hotel -- on purpose, so the change stops reappearing
+           in every dispatch -- so a column reading "yes" for every row was
+           reporting that the dispatcher had finished, under a heading that
+           said somebody had been told. The notifications actually written are
+           what answer that. #}
+        {% set state = delivery.get(change.id) %}
+        {% if state %}<span class="pill {{ state[1] }}">{{ state[0] }}</span>
+        {% else %}<span class="muted">—</span>{% endif %}
+</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted">No confirmed changes in this window.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

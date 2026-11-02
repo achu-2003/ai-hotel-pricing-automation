@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}Hotels · Hotel Price Monitor{% endblock %}
+
+{% block content %}
+<h1>Hotels</h1>
+
+<form class="filters" method="get" action="/hotels">
+  <label>Search <input type="search" name="q" value="{{ q }}" placeholder="Name contains…"></label>
+  <button type="submit">Filter</button>
+</form>
+
+{% if is_admin %}
+{#
+  Room types are absent from this form on purpose. For a competitor, the site
+  decides what its rooms are called and renames them; they are discovered by
+  the first successful fetch and mapped in the Unmatched queue. Letting an
+  operator invent names here would create room types nothing ever matches.
+#}
+<details class="panel">
+  <summary>Add a hotel</summary>
+  <form class="stack api-form" data-endpoint="/api/v1/hotels" data-method="POST">
+    <label>Name <input name="name" required maxlength="200"></label>
+    <label>Location <input name="location" maxlength="200" placeholder="Hilltown, Tamil Nadu"></label>
+    <label class="inline">
+      <input type="checkbox" name="is_own_property" value="true"> This is my own property
+    </label>
+    <label>Notes <textarea name="notes" rows="2"></textarea></label>
+    <button type="submit">Create hotel</button>
+    <p class="form-status" hidden></p>
+    <span class="muted">
+      Next you paste its booking URL on the hotel's own page — the booking
+      engine, price mapping and rooms are all worked out from there.
+    </span>
+  </form>
+</details>
+{% endif %}
+
+{#
+  The table scrolls, not the page. A hotel name is never wrapped, so a narrow
+  window or a zoomed page can leave the table wider than the space it has --
+  and a page that scrolls sideways takes its header and every other section
+  with it. Contained here, the overflow is a table you can push, which is what
+  the matrix page already does with the same class.
+#}
+<div class="scroll-x">
+<table class="grid grid-hotels">
+  {#
+    Explicit lanes. Without them the browser sizes each column by its content,
+    which handed the addresses most of the table and left a band of empty space
+    before Targets -- the columns landing in a different place on every screen
+    and neither edge of that band belonging to anything.
+  #}
+  <colgroup>
+    <col class="col-name">
+    <col class="col-location">
+    <col class="col-targets">
+    <col class="col-status">
+    {% if is_admin %}<col class="col-actions">{% endif %}
+  </colgroup>
+  <thead>
+    <tr><th>Hotel</th><th>Location</th><th class="num">Targets</th><th>Status</th>{% if is_admin %}<th></th>{% endif %}</tr>
+  </thead>
+  <tbody>
+    {% for hotel in hotels %}
+    <tr>
+      <td class="hotel-name">
+        <a href="/hotels/{{ hotel.id }}">{{ hotel.name }}</a>
+        {% if hotel.is_own_property %}<span class="pill pill-own">yours</span>{% endif %}
+      </td>
+      <td class="muted hotel-location">{{ hotel.location or '—' }}</td>
+      <td class="num">{{ target_counts.get(hotel.id, 0) }}</td>
+      <td>
+        {% if hotel.is_active %}<span class="pill pill-ok">active</span>
+        {% else %}<span class="pill pill-off">inactive</span>{% endif %}
+      </td>
+      {% if is_admin %}
+      {#
+        Edit opens the panel on the hotel's own page rather than editing in
+        place. Renaming is rare and the same panel holds the booking link and
+        the delete, so one place beats a row that grows a form.
+      #}
+      {#
+        The flex row goes on a DIV inside the cell, not on the cell. A td with
+        display:flex stops being a table cell: it no longer fills the row's
+        height, so its bottom border draws across the middle of any row a long
+        address has made two lines tall.
+      #}
+      <td class="nowrap">
+        <div class="row-actions">
+          <a href="/hotels/{{ hotel.id }}#hotel-details">Edit</a>
+          {% if hotel.is_active %}
+          <button class="deactivate-hotel" data-hotel-id="{{ hotel.id }}"
+                  data-hotel-name="{{ hotel.name }}">Stop</button>
+          {% else %}
+          <button class="reactivate-hotel" data-hotel-id="{{ hotel.id }}">Resume</button>
+          {% endif %}
+        </div>
+      </td>
+      {% endif %}
+    </tr>
+    {% else %}
+    <tr><td colspan="{{ 5 if is_admin else 4 }}" class="muted">No hotels yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}
